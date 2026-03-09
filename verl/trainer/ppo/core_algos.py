@@ -30,6 +30,16 @@ from omegaconf import DictConfig
 
 import verl.utils.torch_functional as verl_F
 from verl.trainer.config import AlgoConfig
+from verl.trainer.ppo.value_categorical import (
+    ValueHeadSpec,
+    categorical_entropy,
+    clamp_scaled_targets,
+    expected_bin_index,
+    project_scalar_targets_to_probs,
+    scale_scalar_values,
+    soft_target_cross_entropy,
+    value_logits_to_scalar_expectation,
+)
 from verl.utils import as_torch_index, group_mean_std
 from verl.utils.import_utils import deprecated
 from verl.workers.config import ActorConfig
@@ -1845,6 +1855,66 @@ def compute_value_loss(
     vf_loss = 0.5 * agg_loss(loss_mat=clipped_vf_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
     vf_clipfrac = verl_F.masked_mean(torch.gt(vf_losses2, vf_losses1).float(), response_mask)
     return vf_loss, vf_clipfrac
+
+
+def compute_categorical_value_loss(
+    value_logits: torch.Tensor,
+    returns: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    cliprange_value: float,
+    value_spec: ValueHeadSpec,
+    loss_agg_mode: str = "token-mean",
+):
+    """Compute PPO value loss for a categorical critic head.
+
+    The critic predicts logits over value bins and the scalar prediction is the
+    expectation of the predicted categorical distribution. We train with soft-target
+    cross-entropy and keep PPO value clipping semantics by operating clipping on
+    the scalar expectations.
+    """
+    response_mask = response_mask.to(bool)
+    if value_logits.shape[-1] != value_spec.num_bins:
+        raise ValueError(
+            f"value_logits has trailing dim {value_logits.shape[-1]} but value_num_bins={value_spec.num_bins}"
+        )
+    value_logits_for_loss = value_logits.float()
+
+    vpreds, value_probs, _ = value_logits_to_scalar_expectation(value_logits_for_loss, value_spec)
+    vpredclipped = verl_F.clip_by_value(vpreds, values - cliprange_value, values + cliprange_value)
+    vf_losses1 = (vpreds - returns) ** 2
+    vf_losses2 = (vpredclipped - returns) ** 2
+    clip_mask = torch.gt(vf_losses2, vf_losses1)
+    vf_clipfrac = verl_F.masked_mean(clip_mask.float(), response_mask)
+
+    # PPO returns come directly from GAE/return computation and are not guaranteed
+    # to already lie in categorical support range.
+    scaled_returns = scale_scalar_values(returns, value_spec)
+    scaled_returns, out_of_range_fraction = clamp_scaled_targets(scaled_returns, value_spec, valid_mask=response_mask)
+    support = value_spec.support(device=value_logits_for_loss.device, dtype=value_logits_for_loss.dtype)
+    edges = value_spec.bin_edges(device=value_logits_for_loss.device, dtype=value_logits_for_loss.dtype)
+    target_probs = project_scalar_targets_to_probs(
+        scaled_targets=scaled_returns,
+        spec=value_spec,
+        support=support,
+        edges=edges,
+    )
+
+    ce_losses = soft_target_cross_entropy(value_logits=value_logits_for_loss, target_probs=target_probs)
+    # PPO value clipping: when clipped branch is active, block critic gradients on that token.
+    ce_losses = torch.where(clip_mask, ce_losses.detach(), ce_losses)
+    vf_loss = agg_loss(loss_mat=ce_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    value_entropy = categorical_entropy(value_probs)
+    target_entropy = categorical_entropy(target_probs)
+    avg_bin_idx = expected_bin_index(value_probs)
+    metrics = {
+        "critic/value_entropy": verl_F.masked_mean(value_entropy, response_mask),
+        "critic/target_entropy": verl_F.masked_mean(target_entropy, response_mask),
+        "critic/value_bin_idx_mean": verl_F.masked_mean(avg_bin_idx, response_mask),
+        "critic/value_target_out_of_range_fraction": out_of_range_fraction,
+    }
+    return vf_loss, vf_clipfrac, vpreds, metrics
 
 
 def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:

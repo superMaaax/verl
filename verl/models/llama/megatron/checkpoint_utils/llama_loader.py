@@ -300,10 +300,14 @@ def load_state_dict_to_megatron_llama(
         lm_head_weight = gpt_model_module.lm_head.weight
 
         if is_value_model:
-            if "lm_head.weight" in state_dict and state_dict["lm_head.weight"].shape[0] == 1:
+            expected_output_dim = lm_head_weight.shape[0]
+            if "lm_head.weight" in state_dict and state_dict["lm_head.weight"].shape[0] == expected_output_dim:
                 _fetch_tensor(lm_head_weight, "lm_head.weight")
                 print_rank_0("load lm_head weight")
-            elif "reward_head.weight" in state_dict and state_dict["reward_head.weight"].shape[0] == 1:
+            elif (
+                "reward_head.weight" in state_dict
+                and state_dict["reward_head.weight"].shape[0] == expected_output_dim
+            ):
                 _fetch_tensor(lm_head_weight, "reward_head.weight")
                 print_rank_0("load lm_head from value_head weight")
             else:

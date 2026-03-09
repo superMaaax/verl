@@ -98,19 +98,36 @@ def _load_policy(model_dir: Path, dtype: torch.dtype, device: torch.device, trus
 
 def _load_critic(model_dir: Path, dtype: torch.dtype, device: torch.device, trust_remote_code: bool):
     from transformers import AutoConfig
+    from verl.trainer.ppo.value_categorical import extract_value_head_spec
+
+    config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=trust_remote_code)
+    value_spec = None
+    try:
+        value_spec = extract_value_head_spec(config)
+    except Exception:
+        value_spec = None
+
+    is_categorical = value_spec is not None and value_spec.is_categorical()
+    if is_categorical:
+        config.num_labels = int(value_spec.num_bins)
+    else:
+        config.num_labels = 1
 
     try:
         from verl.utils.model import load_valuehead_model
 
-        config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=trust_remote_code)
-        config.num_labels = 1
         model = load_valuehead_model(
             str(model_dir),
             torch_dtype=dtype,
             model_config=config,
             trust_remote_code=trust_remote_code,
         )
-    except Exception:
+    except Exception as exc:
+        if is_categorical:
+            raise RuntimeError(
+                "Failed to load categorical critic with token-classification head. "
+                "Please check checkpoint/config consistency."
+            ) from exc
         try:
             from trl import AutoModelForCausalLMWithValueHead
         except Exception as exc:  # pragma: no cover - runtime dependency
@@ -124,7 +141,7 @@ def _load_critic(model_dir: Path, dtype: torch.dtype, device: torch.device, trus
 
     model.to(device)
     model.eval()
-    return model
+    return model, value_spec
 
 
 def _stringify_chat_messages(messages) -> str:
@@ -331,12 +348,13 @@ def _run_generation(
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
         do_sample=do_sample,
-        temperature=temperature,
-        top_p=top_p,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
         use_cache=True,
     )
+    if do_sample:
+        gen_kwargs["temperature"] = temperature
+        gen_kwargs["top_p"] = top_p
     if gen_config is not None:
         gen_kwargs["generation_config"] = gen_config
 
@@ -354,7 +372,10 @@ def _compute_critic_values(
     input_ids: torch.Tensor,
     prompt_len: int,
     response_len: int,
+    value_spec=None,
 ) -> torch.Tensor:
+    from verl.trainer.ppo.value_categorical import value_logits_to_scalar_expectation
+
     attention_mask = torch.ones_like(input_ids)
     with torch.no_grad():
         outputs = critic(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
@@ -364,7 +385,10 @@ def _compute_critic_values(
     else:
         values = outputs.logits
 
-    if values.dim() == 3:
+    is_categorical = value_spec is not None and value_spec.is_categorical()
+    if is_categorical:
+        values, _, _ = value_logits_to_scalar_expectation(values, value_spec)
+    elif values.dim() == 3:
         values = values.squeeze(-1)
 
     if response_len <= 0:
@@ -660,7 +684,12 @@ def main() -> int:
 
     tokenizer = _prepare_tokenizer(actor_hf, trust_remote_code=args.trust_remote_code, fix_mistral_regex=args.fix_mistral_regex)
     actor = _load_policy(actor_hf, dtype=dtype, device=device, trust_remote_code=args.trust_remote_code)
-    critic = _load_critic(critic_hf, dtype=dtype, device=device, trust_remote_code=args.trust_remote_code)
+    critic, critic_value_spec = _load_critic(
+        critic_hf,
+        dtype=dtype,
+        device=device,
+        trust_remote_code=args.trust_remote_code,
+    )
     gen_config = _get_generation_config(actor_hf)
 
     ds = load_dataset("parquet", data_files=args.dataset_path, split="train")
@@ -718,6 +747,7 @@ def main() -> int:
                 output_ids,
                 prompt_len=prompt_len,
                 response_len=response_len,
+                value_spec=critic_value_spec,
             )
             values_list = values[0].detach().cpu().tolist()
             response_ids_list = response_ids[0].detach().cpu().tolist()

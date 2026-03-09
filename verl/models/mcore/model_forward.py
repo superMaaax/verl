@@ -152,7 +152,8 @@ def model_forward_gen(vision_model: bool = False):
                     output_orig, new_attention_mask, attention_mask, sequence_length, post_process=post_process
                 )
         if value_model and post_process:
-            output = output[..., 0]
+            if output.shape[-1] == 1:
+                output = output[..., 0]
         return output
 
     return model_forward
@@ -279,6 +280,7 @@ def gptmodel_forward_no_padding(
         # while using nested tensor, the advanced indexing operation above will result in an error at backward, i.e.
         # ValueError: NestedTensor _nested_select_backward_default(grad_output: t, self: jt_all, dim: any, index: any)
         # so we use `squeeze` to remove the last dimension
-        output = output.squeeze(-1)
+        if output.shape[-1] == 1:
+            output = output.squeeze(-1)
 
     return output

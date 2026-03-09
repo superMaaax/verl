@@ -17,7 +17,14 @@ import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
-from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    compute_categorical_value_loss,
+    compute_value_loss,
+    get_policy_loss_fn,
+    kl_penalty,
+)
+from verl.trainer.ppo.value_categorical import extract_value_head_spec
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.metric import AggregationType, Metric
@@ -88,7 +95,16 @@ def _slice_response_from_unpad_output(tensor: torch.Tensor, data: TensorDict) ->
     for resp_len, seq_offset in zip(response_lens, sequence_offsets, strict=True):
         pad_size = max_response_len - resp_len
         # left-shift model output by one token for log_probs/values
-        response_list.append(F.pad(values[seq_offset - resp_len - 1 : seq_offset - 1], (0, pad_size)))
+        resp_slice = values[seq_offset - resp_len - 1 : seq_offset - 1]
+        if pad_size > 0:
+            if resp_slice.dim() == 1:
+                resp_slice = F.pad(resp_slice, (0, pad_size))
+            else:
+                # Pad on sequence dimension while preserving trailing feature dimensions.
+                pad_dims = [0, 0] * (resp_slice.dim() - 1)
+                pad_dims.extend([0, pad_size])
+                resp_slice = F.pad(resp_slice, tuple(pad_dims))
+        response_list.append(resp_slice)
 
     output = torch.stack(response_list, dim=0)
     return output
@@ -188,20 +204,36 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
     Returns:
         value loss
     """
-    vpreds = _slice_response_from_unpad_output(model_output["values"], data)  # (bsz, response_length)
-
     values = data["values"]
     returns = data["returns"]
     response_mask = data["response_mask"].to(bool)
+    value_spec = extract_value_head_spec(config)
 
-    vf_loss, vf_clipfrac = compute_value_loss(
-        vpreds=vpreds,
-        values=values,
-        returns=returns,
-        response_mask=response_mask,
-        cliprange_value=config.cliprange_value,
-        loss_agg_mode=config.loss_agg_mode,
-    )
+    if value_spec.is_categorical():
+        value_logits = model_output.get("value_logits", model_output["values"])
+        value_logits = _slice_response_from_unpad_output(value_logits, data)  # (bsz, response_length, num_bins)
+        vf_loss, vf_clipfrac, vpreds, categorical_metrics = compute_categorical_value_loss(
+            value_logits=value_logits,
+            values=values,
+            returns=returns,
+            response_mask=response_mask,
+            cliprange_value=config.cliprange_value,
+            value_spec=value_spec,
+            loss_agg_mode=config.loss_agg_mode,
+        )
+    else:
+        vpreds = _slice_response_from_unpad_output(model_output["values"], data)  # (bsz, response_length)
+        if vpreds.dim() > 2 and vpreds.shape[-1] == 1:
+            vpreds = vpreds.squeeze(-1)
+        vf_loss, vf_clipfrac = compute_value_loss(
+            vpreds=vpreds,
+            values=values,
+            returns=returns,
+            response_mask=response_mask,
+            cliprange_value=config.cliprange_value,
+            loss_agg_mode=config.loss_agg_mode,
+        )
+        categorical_metrics = {}
 
     metrics = {}
 
@@ -212,5 +244,10 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
             "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
         }
     )
+    for metric_name, metric_value in categorical_metrics.items():
+        if isinstance(metric_value, torch.Tensor):
+            metrics[metric_name] = metric_value.detach().item()
+        else:
+            metrics[metric_name] = metric_value
 
     return vf_loss, metrics

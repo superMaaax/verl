@@ -388,6 +388,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
             adapter_ctx = self.engine.disable_adapter() if no_lora_adapter else nullcontext()
             with adapter_ctx:
                 output = self.engine.infer_batch(data, loss_function=loss_function)
+                if not compute_loss and "model_output" in output:
+                    output["model_output"].pop("value_logits", None)
         delta_time = timer.last
 
         if self.engine.is_mp_src_rank_with_outputs():

@@ -68,6 +68,7 @@ class BaseModelInitializer(ABC):
             GPTModel: An initialized GPT model instance
         """
         vp_stage = extra_kwargs.get("vp_stage", None)
+        value_head_output_size = extra_kwargs.get("value_head_output_size", 1)
         transformer_layer_spec = self.get_transformer_layer_spec(vp_stage=vp_stage)
         rope_scaling_args = self.get_rope_scaling_args()
         mtp_block_spec = extra_kwargs.get("mtp_block_spec", None)
@@ -90,7 +91,9 @@ class BaseModelInitializer(ABC):
             from verl.models.llama.megatron.layers.parallel_linear import LinearForLastLayer
 
             model.output_layer = LinearForLastLayer(
-                input_size=self.tfconfig.hidden_size, output_size=1, config=self.tfconfig
+                input_size=self.tfconfig.hidden_size,
+                output_size=value_head_output_size,
+                config=self.tfconfig,
             )
 
         return model
@@ -221,6 +224,7 @@ class Qwen25VLModel(BaseModelInitializer):
     ):
         tfconfig = self.tfconfig
         hf_config = self.hf_config
+        value_head_output_size = extra_kwargs.get("value_head_output_size", 1)
         # Qwen2_5_VLForConditionalGeneration
         from copy import deepcopy
 
@@ -270,7 +274,9 @@ class Qwen25VLModel(BaseModelInitializer):
             from verl.models.llama.megatron.layers.parallel_linear import LinearForLastLayer
 
             qwen25_vl_model.language_model.output_layer = LinearForLastLayer(
-                input_size=tfconfig.hidden_size, output_size=1, config=tfconfig
+                input_size=tfconfig.hidden_size,
+                output_size=value_head_output_size,
+                config=tfconfig,
             )
 
         return qwen25_vl_model

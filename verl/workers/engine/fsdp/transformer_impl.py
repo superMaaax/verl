@@ -33,6 +33,7 @@ from torch.distributed.tensor import DTensor
 import verl.utils.torch_functional as verl_F
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.trainer.config import CheckpointConfig
+from verl.trainer.ppo.value_categorical import extract_value_head_spec, value_logits_to_scalar_expectation
 from verl.utils import tensordict_utils as tu
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
@@ -1047,33 +1048,56 @@ class FSDPEngineWithValueHead(FSDPEngineWithLMHead):
     def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
+        value_spec = extract_value_head_spec(self.model_config.hf_config)
+        is_categorical_value = value_spec.is_categorical()
 
         input_ids = micro_batch["input_ids"]
+        value_logits = None
         if use_remove_padding:
             if hasattr(self.module, "v_head"):
+                if is_categorical_value:
+                    raise ValueError(
+                        "Categorical critic requires logits over bins from a token-classification head. "
+                        "TRL value heads are scalar-only."
+                    )
                 # For trl.AutoModelForCausalLMWithValueHead
                 values_rmpad = output[2].squeeze(0).unsqueeze(-1)
             else:
                 values_rmpad = output.logits
-                values_rmpad = values_rmpad.squeeze(0)  # (total_nnz, 1)
-                # critic model arch is like Qwen3ForTokenClassfication and num_labels=1
-                # so we squeeze the last dimension here to get the value for each token
-                values_rmpad = values_rmpad.squeeze(-1)
+                values_rmpad = values_rmpad.squeeze(0)
+                if is_categorical_value:
+                    value_logits_rmpad = values_rmpad
+                    values_rmpad, _, _ = value_logits_to_scalar_expectation(value_logits_rmpad, value_spec)
+                else:
+                    # critic model arch is like Qwen3ForTokenClassification and num_labels=1
+                    values_rmpad = values_rmpad.squeeze(-1)
+                    value_logits_rmpad = None
 
             # gather output if sp > 1
             if self.use_ulysses_sp:
                 pad_size = output_args["pad_size"]
                 values_rmpad = gather_outputs_and_unpad(values_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+                if is_categorical_value:
+                    value_logits_rmpad = gather_outputs_and_unpad(
+                        value_logits_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
+                    )
 
             if pad_mode == DatasetPadMode.NO_PADDING:
                 cu_seqlens = input_ids.offsets()
                 # (bsz, j1), for each sample, is the length of each sample: [real_prompt length + real_response length]
                 values = torch.nested.nested_tensor_from_jagged(values_rmpad, cu_seqlens)
+                if is_categorical_value:
+                    value_logits = torch.nested.nested_tensor_from_jagged(value_logits_rmpad, cu_seqlens)
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
         else:
             if hasattr(self.module, "v_head"):
+                if is_categorical_value:
+                    raise ValueError(
+                        "Categorical critic requires logits over bins from a token-classification head. "
+                        "TRL value heads are scalar-only."
+                    )
                 # For trl.AutoModelForCausalLMWithValueHead
                 values = output[2]
             else:
@@ -1085,9 +1109,18 @@ class FSDPEngineWithValueHead(FSDPEngineWithLMHead):
                 starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
                 values = torch.nested.narrow(values, 1, starts, seq_lengths, layout=torch.jagged)
                 values_rmpad = torch.cat([t for t in values.unbind()])
+                if is_categorical_value:
+                    value_logits_rmpad = values_rmpad
+                    values_rmpad, _, _ = value_logits_to_scalar_expectation(value_logits_rmpad, value_spec)
+                    value_logits = torch.nested.nested_tensor_from_jagged(value_logits_rmpad, cu_seqlens)
+                else:
+                    values_rmpad = values_rmpad.squeeze(-1)
                 # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
                 values = torch.nested.nested_tensor_from_jagged(values_rmpad, cu_seqlens)
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
-        return {"values": values}
+        model_output = {"values": values}
+        if value_logits is not None:
+            model_output["value_logits"] = value_logits
+        return model_output

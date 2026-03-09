@@ -1117,7 +1117,9 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
                         self.bridge.load_weights(critic_module, local_model_path)
                     else:
                         self.bridge.load_hf_weights(
-                            critic_module, local_model_path, allowed_mismatched_params=["output_layer.weight"]
+                            critic_module,
+                            local_model_path,
+                            allowed_mismatched_params=["output_layer.weight", "output_layer.bias"],
                         )
                 else:
                     load_megatron_gptmodel_weights(
@@ -1149,6 +1151,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
     def init_model(self):
         # create critic
 
+        from verl.trainer.ppo.value_categorical import extract_value_head_spec
         from verl.utils.torch_dtypes import PrecisionType
 
         if self.config.model.get("external_lib", None) is not None:
@@ -1157,6 +1160,20 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
 
             importlib.import_module(self.config.model.external_lib)
         override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
+        value_spec = extract_value_head_spec(self.config)
+        model_override = override_model_config.setdefault("model_config", {})
+        model_override["num_labels"] = value_spec.num_bins if value_spec.is_categorical() else 1
+        model_override["value_head_type"] = value_spec.head_type
+        model_override["value_num_bins"] = value_spec.num_bins
+        model_override["value_min"] = value_spec.value_min
+        model_override["value_max"] = value_spec.value_max
+        model_override["value_target_type"] = value_spec.target_type
+        model_override["value_hl_gauss_sigma"] = value_spec.hl_gauss_sigma
+        model_override["value_hl_gauss_sigma_ratio"] = value_spec.hl_gauss_sigma_ratio
+        model_override["value_target_scaling"] = value_spec.target_scaling
+        model_override["value_target_scale_min"] = value_spec.target_scale_min
+        model_override["value_target_scale_max"] = value_spec.target_scale_max
+        model_override["value_target_out_of_range"] = value_spec.target_out_of_range
         override_transformer_config = OmegaConf.to_container(
             OmegaConf.create(self.config.megatron.get("override_transformer_config", {}))
         )

@@ -177,6 +177,46 @@ class McoreModuleWrapperConfig:
     use_distributed_optimizer: bool = True
 
 
+def _resolve_value_model_hook(
+    make_value_model_fn,
+    *,
+    output_size: int,
+    hidden_size: int | None = None,
+    sequence_parallel: bool | None = None,
+):
+    """Best-effort adapter across bridge callback variants."""
+    kwargs_candidates = []
+    if hidden_size is not None and sequence_parallel is not None:
+        kwargs_candidates.append(
+            {"hidden_size": hidden_size, "sequence_parallel": sequence_parallel, "output_size": output_size}
+        )
+        kwargs_candidates.append({"hidden_size": hidden_size, "sequence_parallel": sequence_parallel})
+    kwargs_candidates.append({"output_size": output_size})
+    kwargs_candidates.append({})
+
+    args_candidates = []
+    if hidden_size is not None and sequence_parallel is not None:
+        args_candidates.append((hidden_size, sequence_parallel, output_size))
+        args_candidates.append((hidden_size, sequence_parallel))
+    args_candidates.append((output_size,))
+    args_candidates.append(tuple())
+
+    for kwargs in kwargs_candidates:
+        try:
+            return make_value_model_fn(**kwargs)
+        except TypeError:
+            continue
+
+    for args in args_candidates:
+        try:
+            return make_value_model_fn(*args)
+        except TypeError:
+            continue
+
+    # Fallback: treat imported symbol as the hook itself.
+    return make_value_model_fn
+
+
 def make_megatron_module(
     wrap_config: McoreModuleWrapperConfig,
     tf_config: TransformerConfig,
@@ -190,19 +230,25 @@ def make_megatron_module(
 ):
     if override_model_config is None:
         override_model_config = {}
+    value_output_size = int(getattr(hf_config, "num_labels", 1))
 
     if bridge is not None:
         if provider is None:
             from verl.models.mcore.mbridge import freeze_moe_router, make_value_model
 
-            value_model_hook = make_value_model
+            value_model_hook = _resolve_value_model_hook(make_value_model, output_size=value_output_size)
         else:
             from verl.models.mcore.bridge import freeze_moe_router, make_value_model
 
             hidden_size = (
                 hf_config.text_config.hidden_size if hasattr(hf_config, "text_config") else hf_config.hidden_size
             )
-            value_model_hook = make_value_model(hidden_size, provider.sequence_parallel)
+            value_model_hook = _resolve_value_model_hook(
+                make_value_model,
+                hidden_size=hidden_size,
+                sequence_parallel=provider.sequence_parallel,
+                output_size=value_output_size,
+            )
 
         post_model_creation_callbacks = []
         if wrap_config.is_value_model:
@@ -301,6 +347,7 @@ def make_megatron_module(
                 post_process,
                 share_embeddings_and_output_weights=wrap_config.share_embeddings_and_output_weights,
                 value=wrap_config.is_value_model,
+                value_head_output_size=value_output_size,
                 freeze_moe_router=override_model_config.get("moe_config", {}).get("freeze_moe_router", False),
                 vp_stage=vp_stage,
             )

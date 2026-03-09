@@ -26,6 +26,7 @@ from tensordict import TensorDict
 import verl.utils.torch_functional as verl_F
 from verl.models.mcore import get_mcore_forward_fused_no_padding_fn, get_mcore_weight_converter
 from verl.trainer.config import CheckpointConfig
+from verl.trainer.ppo.value_categorical import extract_value_head_spec, value_logits_to_scalar_expectation
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -241,7 +242,7 @@ class MegatronEngine(BaseEngine):
             else:
                 allowed_mismatched_params = []
                 if self.is_value_model:
-                    allowed_mismatched_params = ["output_layer.weight"]
+                    allowed_mismatched_params = ["output_layer.weight", "output_layer.bias"]
                 self.bridge.load_hf_weights(
                     module, self.model_config.local_path, allowed_mismatched_params=allowed_mismatched_params
                 )
@@ -862,4 +863,10 @@ class MegatronEngineWithValueHead(MegatronEngineWithLMHead):
         return output, partial(postprocess_micro_batch_func, data=batch)
 
     def prepare_model_outputs(self, output: dict | torch.Tensor, data: TensorDict):
+        if isinstance(output, dict):
+            output = output.get("values", output)
+        value_spec = extract_value_head_spec(self.model_config.hf_config)
+        if value_spec.is_categorical():
+            values, _, _ = value_logits_to_scalar_expectation(output, value_spec)
+            return {"values": values, "value_logits": output}
         return {"values": output}

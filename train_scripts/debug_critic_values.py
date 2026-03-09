@@ -73,7 +73,6 @@ def _load_critic(model_dir: Path, dtype: torch.dtype, device: torch.device, trus
         from verl.utils.model import load_valuehead_model
 
         config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=trust_remote_code)
-        config.num_labels = 1
         model = load_valuehead_model(
             str(model_dir),
             torch_dtype=dtype,
@@ -233,7 +232,23 @@ def _compute_critic_values(
     else:
         values = outputs.logits
 
-    if values.dim() == 3:
+    if values.dim() == 3 and values.shape[-1] > 1:
+        # Categorical critic head: convert logits to scalar expectation.
+        cfg = getattr(critic, "config", None)
+        num_bins = int(getattr(cfg, "value_num_bins", values.shape[-1]))
+        vmin = float(getattr(cfg, "value_min", 0.0))
+        vmax = float(getattr(cfg, "value_max", 1.0))
+        support = torch.linspace(vmin, vmax, num_bins, device=values.device, dtype=torch.float32)
+        probs = torch.softmax(values.float(), dim=-1)
+        scaled_values = (probs * support).sum(dim=-1)
+
+        target_scaling = getattr(cfg, "value_target_scaling", "identity")
+        if target_scaling == "affine":
+            raw_min = float(getattr(cfg, "value_target_scale_min", vmin))
+            raw_max = float(getattr(cfg, "value_target_scale_max", vmax))
+            scaled_values = ((scaled_values - vmin) / (vmax - vmin)) * (raw_max - raw_min) + raw_min
+        values = scaled_values
+    elif values.dim() == 3:
         values = values.squeeze(-1)
 
     if response_len <= 0:

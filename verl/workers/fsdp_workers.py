@@ -1355,6 +1355,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         # the following line is necessary
         from torch.distributed.fsdp import MixedPrecision
 
+        from verl.trainer.ppo.value_categorical import apply_value_head_spec_to_hf_config, extract_value_head_spec
         from verl.utils.model import load_valuehead_model, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
 
@@ -1373,6 +1374,7 @@ class CriticWorker(Worker, DistProfilerExtension):
             else:
                 self.tokenizer.chat_template = self.config.model.custom_chat_template
         override_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
+        value_spec = extract_value_head_spec(self.config)
         override_config_kwargs = {
             "bos_token_id": self.tokenizer.bos_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
@@ -1400,12 +1402,13 @@ class CriticWorker(Worker, DistProfilerExtension):
         if self.ulysses_sequence_parallel_size > 1 and hasattr(critic_model_config, "vision_config"):
             critic_model_config.vision_config._attn_implementation = "eager"
 
-        critic_model_config.num_labels = 1
+        critic_model_config.num_labels = value_spec.num_bins if value_spec.is_categorical() else 1
         # patch for kimi-vl
         if getattr(critic_model_config, "model_type", None) == "kimi_vl":
             critic_model_config.text_config.topk_method = "greedy"
 
         update_model_config(critic_model_config, override_config_kwargs=override_config_kwargs)
+        apply_value_head_spec_to_hf_config(critic_model_config, value_spec)
         if self.rank == 0:
             print(f"Critic model config after override: {critic_model_config}")
 

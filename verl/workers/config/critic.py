@@ -19,6 +19,7 @@ from typing import Optional
 from omegaconf import MISSING
 
 from verl.base_config import BaseConfig
+from verl.trainer.ppo.value_categorical import ValueHeadSpec, apply_value_head_spec_to_hf_config
 from verl.trainer.config import BaseModelConfig, CheckpointConfig
 from verl.utils.profiler import ProfilerConfig
 
@@ -49,6 +50,17 @@ class CriticConfig(BaseConfig):
         ppo_epochs (int): Number of PPO epochs per batch.
         shuffle (bool): Shuffle training data across PPO epochs.
         cliprange_value (float): PPO value function clipping range.
+        value_head_type (str): Critic value head type, "scalar" or "categorical".
+        value_num_bins (int): Number of bins for categorical value head.
+        value_min (float): Minimum value in categorical support.
+        value_max (float): Maximum value in categorical support.
+        value_target_type (str): Categorical target projection type.
+        value_hl_gauss_sigma (Optional[float]): Fixed sigma for HL-Gauss target projection.
+        value_hl_gauss_sigma_ratio (float): Sigma ratio to bin width when sigma is not provided.
+        value_target_scaling (str): Scalar target scaling mode before projection.
+        value_target_scale_min (float): Raw scalar minimum for affine scaling mode.
+        value_target_scale_max (float): Raw scalar maximum for affine scaling mode.
+        value_target_out_of_range (str): Behavior when scaled targets are outside support.
         loss_agg_mode (str): Loss aggregation mode.
         checkpoint (Dict[str, Any]): Checkpoint configuration.
         profiler (Dict[str, Any]): Profiler configuration.
@@ -77,6 +89,17 @@ class CriticConfig(BaseConfig):
     data_loader_seed: int = 1
     shuffle: bool = True
     cliprange_value: float = 0.5
+    value_head_type: str = "scalar"
+    value_num_bins: int = 11
+    value_min: float = 0.0
+    value_max: float = 1.0
+    value_target_type: str = "two_hot"
+    value_hl_gauss_sigma: Optional[float] = None
+    value_hl_gauss_sigma_ratio: float = 0.75
+    value_target_scaling: str = "identity"
+    value_target_scale_min: float = 0.0
+    value_target_scale_max: float = 1.0
+    value_target_out_of_range: str = "error"
     loss_agg_mode: str = "token-mean"
     ppo_micro_batch_size: Optional[int] = None
     engine: BaseConfig = field(default_factory=BaseConfig)
@@ -100,6 +123,23 @@ class CriticConfig(BaseConfig):
                 external_lib=self.model.external_lib,
                 trust_remote_code=self.model.trust_remote_code,
             )
+
+        value_spec = ValueHeadSpec(
+            head_type=self.value_head_type,
+            num_bins=self.value_num_bins,
+            value_min=self.value_min,
+            value_max=self.value_max,
+            target_type=self.value_target_type,
+            hl_gauss_sigma=self.value_hl_gauss_sigma,
+            hl_gauss_sigma_ratio=self.value_hl_gauss_sigma_ratio,
+            target_scaling=self.value_target_scaling,
+            target_scale_min=self.value_target_scale_min,
+            target_scale_max=self.value_target_scale_max,
+            target_out_of_range=self.value_target_out_of_range,
+        )
+        value_spec.validate()
+        # Keep HF model config synchronized with critic head setup.
+        apply_value_head_spec_to_hf_config(self.model_config.hf_config, value_spec)
 
         if not self.use_dynamic_bsz:
             self._check_mutually_exclusive(self.ppo_micro_batch_size, self.ppo_micro_batch_size_per_gpu, "critic")

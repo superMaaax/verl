@@ -31,6 +31,7 @@ from torch import nn
 
 from verl import DataProto
 from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.value_categorical import extract_value_head_spec, value_logits_to_scalar_expectation
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.profiler import GPUMemoryLogger
@@ -63,6 +64,7 @@ class MegatronPPOCritic(BasePPOCritic):
         self.critic_module = critic_module
         self.critic_optimizer = critic_optimizer
         self.critic_optimizer_config = critic_optimizer_config
+        self.value_spec = extract_value_head_spec(self.config)
 
         # we create a separate nametuple for optimizer step so that global args won't affect it.
         self.optimizer_step_args = OmegaConf.create(
@@ -120,12 +122,21 @@ class MegatronPPOCritic(BasePPOCritic):
                     revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
                     values = values[revert_indices]
             else:
-                values = torch.empty_like(attention_mask, dtype=torch.float32)
+                if self.value_spec.is_categorical():
+                    values = torch.empty(
+                        (*attention_mask.shape, self.value_spec.num_bins),
+                        dtype=torch.float32,
+                        device=attention_mask.device,
+                    )
+                else:
+                    values = torch.empty_like(attention_mask, dtype=torch.float32)
 
             # each tp ranks should contain the same value
             values = values[
                 :, -response_length - 1 : -1
             ]  # Values are predicted at the ends of prefixes, e.g., the last prompt token
+            if self.value_spec.is_categorical():
+                values, _, _ = value_logits_to_scalar_expectation(values, self.value_spec)
             response_mask = attention_mask[:, -response_length:]
             values = values * response_mask  # Only action tokens have values
             values = values.contiguous()
@@ -223,23 +234,38 @@ class MegatronPPOCritic(BasePPOCritic):
 
             cliprange_value = self.config.cliprange_value
 
-            vpreds = output  # (bs, sequence_length)
-            vpreds = vpreds[:, -response_length - 1 : -1]
-
-            vf_loss, vf_clipfrac = core_algos.compute_value_loss(
-                vpreds=vpreds,
-                values=values,
-                returns=returns,
-                response_mask=response_mask,
-                cliprange_value=cliprange_value,
-                loss_agg_mode=self.config.loss_agg_mode,
-            )
+            vpreds_or_logits = output[:, -response_length - 1 : -1]
+            if self.value_spec.is_categorical():
+                vf_loss, vf_clipfrac, vpreds, categorical_metrics = core_algos.compute_categorical_value_loss(
+                    value_logits=vpreds_or_logits,
+                    values=values,
+                    returns=returns,
+                    response_mask=response_mask,
+                    cliprange_value=cliprange_value,
+                    value_spec=self.value_spec,
+                    loss_agg_mode=self.config.loss_agg_mode,
+                )
+            else:
+                vpreds = vpreds_or_logits
+                vf_loss, vf_clipfrac = core_algos.compute_value_loss(
+                    vpreds=vpreds,
+                    values=values,
+                    returns=returns,
+                    response_mask=response_mask,
+                    cliprange_value=cliprange_value,
+                    loss_agg_mode=self.config.loss_agg_mode,
+                )
+                categorical_metrics = {}
 
             stats = {
                 "critic/vf_loss": vf_loss.detach().item(),
                 "critic/vf_clipfrac": vf_clipfrac.detach().item(),
                 "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
             }
+            for metric_name, metric_value in categorical_metrics.items():
+                if isinstance(metric_value, torch.Tensor):
+                    metric_value = metric_value.detach().item()
+                stats[metric_name] = metric_value
 
             return vf_loss, stats
 

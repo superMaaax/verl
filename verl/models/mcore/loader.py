@@ -468,13 +468,26 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
             lm_head_weight = gpt_model_module.output_layer.weight
 
         if is_value_model:
+            expected_output_dim = None if lm_head_weight is None else lm_head_weight.shape[0]
             # if torch.distributed.get_rank() == src_rank:
-            if "lm_head.weight" in state_dict and state_dict["lm_head.weight"].shape[0] == 1:
+            if (
+                "lm_head.weight" in state_dict
+                and expected_output_dim is not None
+                and state_dict["lm_head.weight"].shape[0] == expected_output_dim
+            ):
                 _broadcast_tensor(lm_head_weight, "lm_head.weight")
-            elif "reward_head.weight" in state_dict and state_dict["reward_head.weight"].shape[0] == 1:
+            elif (
+                "reward_head.weight" in state_dict
+                and expected_output_dim is not None
+                and state_dict["reward_head.weight"].shape[0] == expected_output_dim
+            ):
                 _broadcast_tensor(lm_head_weight, "reward_head.weight")
                 print_rank_0("load lm_head from value_head weight")
-            elif "score.weight" in state_dict and state_dict["score.weight"].shape[0] == 1:
+            elif (
+                "score.weight" in state_dict
+                and expected_output_dim is not None
+                and state_dict["score.weight"].shape[0] == expected_output_dim
+            ):
                 _broadcast_tensor(lm_head_weight, "score.weight")
                 print_rank_0("load lm_head from score weight")
             else:

@@ -94,7 +94,7 @@ class LinearForLastLayer(torch.nn.Linear):
 AutoMapping.register_module_type("LinearForLastLayer", "replicated")
 
 
-def make_value_model(hidden_size, sequence_parallel):
+def make_value_model(hidden_size, sequence_parallel, output_size=1):
     """Creates a pre-wrap hook that replace the output layer with a value head.
 
     Args:
@@ -128,7 +128,7 @@ def make_value_model(hidden_size, sequence_parallel):
 
             model_chunk.output_layer = LinearForLastLayer(
                 input_size=hidden_size,
-                output_size=1,
+                output_size=output_size,
                 sequence_parallel=sequence_parallel,
             )
 

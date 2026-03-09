@@ -79,6 +79,39 @@ data_loader_seed: 42
 # PPO value function clipping range
 cliprange_value: 0.5
 
+# Critic value head type: "scalar" or "categorical"
+value_head_type: scalar
+
+# Number of bins for categorical critic head
+value_num_bins: 11
+
+# Minimum scalar value represented by categorical support
+value_min: 0.0
+
+# Maximum scalar value represented by categorical support
+value_max: 1.0
+
+# Target projection for categorical value loss: "two_hot", "hl_gauss", or "one_hot"
+value_target_type: two_hot
+
+# Optional fixed sigma for HL-Gauss target projection. If null, use value_hl_gauss_sigma_ratio * bin_width.
+value_hl_gauss_sigma: null
+
+# Sigma-to-bin-width ratio when value_hl_gauss_sigma is null
+value_hl_gauss_sigma_ratio: 0.75
+
+# Scaling mode for scalar returns before categorical projection: "identity" or "affine"
+value_target_scaling: identity
+
+# Raw scalar minimum used by affine target scaling
+value_target_scale_min: 0.0
+
+# Raw scalar maximum used by affine target scaling
+value_target_scale_max: 1.0
+
+# Behavior when scaled targets are outside [value_min, value_max]: "error", "warn", or "clip"
+value_target_out_of_range: error
+
 # Loss aggregation mode: "token-mean", "seq-mean-token-sum", or "seq-mean-token-mean"
 loss_agg_mode: ${oc.select:actor_rollout_ref.actor.loss_agg_mode,token-mean}
 

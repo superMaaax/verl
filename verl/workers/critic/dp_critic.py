@@ -25,6 +25,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl import DataProto
 from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.value_categorical import extract_value_head_spec, value_logits_to_scalar_expectation
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -44,6 +45,12 @@ class DataParallelPPOCritic(BasePPOCritic):
         super().__init__(config=config)
         self.critic_module = critic_module
         self.critic_optimizer = critic_optimizer
+        self.value_spec = extract_value_head_spec(self.config)
+        if self.value_spec.is_categorical() and hasattr(self.critic_module, "v_head"):
+            raise ValueError(
+                "Categorical critic requires token-classification logits. "
+                "TRL AutoModelForCausalLMWithValueHead is scalar-only."
+            )
         self.use_remove_padding = self.config.model.get("use_remove_padding", False)
         print(f"Critic use_remove_padding={self.use_remove_padding}")
 
@@ -51,6 +58,7 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.device_name = get_device_name()
 
     def _forward_micro_batch(self, micro_batch):
+        is_categorical_value = self.value_spec.is_categorical()
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
@@ -100,11 +108,18 @@ class DataParallelPPOCritic(BasePPOCritic):
                 )  # prevent model thinks we are generating
 
                 if hasattr(self.critic_module, "v_head"):
+                    if is_categorical_value:
+                        raise ValueError(
+                            "Categorical critic requires logits over bins from a token-classification head. "
+                            "TRL value heads are scalar-only."
+                        )
                     # For trl.AutoModelForCausalLMWithValueHead
                     values_rmpad = output[2].squeeze(0).unsqueeze(-1)
                 else:
                     values_rmpad = output.logits
                     values_rmpad = values_rmpad.squeeze(0)  # (total_nnz)
+                    if not is_categorical_value:
+                        values_rmpad = values_rmpad.squeeze(-1)
 
                 # gather output if sp > 1
                 if self.ulysses_sequence_parallel_size > 1:
@@ -113,7 +128,9 @@ class DataParallelPPOCritic(BasePPOCritic):
                     )
 
                 # pad it back
-                values = pad_input(values_rmpad, indices=indices, batch=batch, seqlen=seqlen).squeeze(-1)
+                values = pad_input(values_rmpad, indices=indices, batch=batch, seqlen=seqlen)
+                if not is_categorical_value:
+                    values = values.squeeze(-1)
                 values = values[:, -response_length - 1 : -1]
             else:
                 output = self.critic_module(
@@ -124,11 +141,18 @@ class DataParallelPPOCritic(BasePPOCritic):
                     use_cache=False,
                 )  # prevent model thinks we are generating
                 if hasattr(self.critic_module, "v_head"):
+                    if is_categorical_value:
+                        raise ValueError(
+                            "Categorical critic requires logits over bins from a token-classification head. "
+                            "TRL value heads are scalar-only."
+                        )
                     # For trl.AutoModelForCausalLMWithValueHead
                     values = output[2]
                 else:
                     values = output.logits
-                values = values[:, -response_length - 1 : -1].squeeze(-1)
+                values = values[:, -response_length - 1 : -1]
+                if not is_categorical_value:
+                    values = values.squeeze(-1)
             return values
 
     def _optimizer_step(self):
@@ -182,6 +206,9 @@ class DataParallelPPOCritic(BasePPOCritic):
         if use_dynamic_bsz:
             values = restore_dynamic_batch(values, batch_idx_list)
 
+        if self.value_spec.is_categorical():
+            values, _, _ = value_logits_to_scalar_expectation(values, self.value_spec)
+
         if "response_mask" in data.batch:
             response_mask = data.batch["response_mask"]
             response_mask = response_mask.to(values.device)
@@ -227,15 +254,28 @@ class DataParallelPPOCritic(BasePPOCritic):
                     values = model_inputs["values"]
                     returns = model_inputs["returns"]
 
-                    vpreds = self._forward_micro_batch(model_inputs)
-                    vf_loss, vf_clipfrac = core_algos.compute_value_loss(
-                        vpreds=vpreds,
-                        values=values,
-                        returns=returns,
-                        response_mask=response_mask,
-                        cliprange_value=self.config.cliprange_value,
-                        loss_agg_mode=self.config.loss_agg_mode,
-                    )
+                    vpreds_or_logits = self._forward_micro_batch(model_inputs)
+                    if self.value_spec.is_categorical():
+                        vf_loss, vf_clipfrac, vpreds, categorical_metrics = core_algos.compute_categorical_value_loss(
+                            value_logits=vpreds_or_logits,
+                            values=values,
+                            returns=returns,
+                            response_mask=response_mask,
+                            cliprange_value=self.config.cliprange_value,
+                            value_spec=self.value_spec,
+                            loss_agg_mode=self.config.loss_agg_mode,
+                        )
+                    else:
+                        vpreds = vpreds_or_logits
+                        vf_loss, vf_clipfrac = core_algos.compute_value_loss(
+                            vpreds=vpreds,
+                            values=values,
+                            returns=returns,
+                            response_mask=response_mask,
+                            cliprange_value=self.config.cliprange_value,
+                            loss_agg_mode=self.config.loss_agg_mode,
+                        )
+                        categorical_metrics = {}
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
@@ -252,6 +292,10 @@ class DataParallelPPOCritic(BasePPOCritic):
                             "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
                         }
                     )
+                    for metric_name, metric_value in categorical_metrics.items():
+                        if isinstance(metric_value, torch.Tensor):
+                            metric_value = metric_value.detach().item()
+                        micro_batch_metrics[metric_name] = metric_value
 
                     metrics["critic/vf_loss"] += vf_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
