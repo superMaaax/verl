@@ -1355,7 +1355,12 @@ class CriticWorker(Worker, DistProfilerExtension):
         # the following line is necessary
         from torch.distributed.fsdp import MixedPrecision
 
-        from verl.trainer.ppo.value_categorical import apply_value_head_spec_to_hf_config, extract_value_head_spec
+        from verl.trainer.ppo.value_categorical import (
+            apply_value_head_architecture_spec_to_hf_config,
+            apply_value_head_spec_to_hf_config,
+            extract_value_head_architecture_spec,
+            extract_value_head_spec,
+        )
         from verl.utils.model import load_valuehead_model, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
 
@@ -1375,6 +1380,7 @@ class CriticWorker(Worker, DistProfilerExtension):
                 self.tokenizer.chat_template = self.config.model.custom_chat_template
         override_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
         value_spec = extract_value_head_spec(self.config)
+        value_head_arch_spec = extract_value_head_architecture_spec(self.config)
         override_config_kwargs = {
             "bos_token_id": self.tokenizer.bos_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
@@ -1409,6 +1415,7 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         update_model_config(critic_model_config, override_config_kwargs=override_config_kwargs)
         apply_value_head_spec_to_hf_config(critic_model_config, value_spec)
+        apply_value_head_architecture_spec_to_hf_config(critic_model_config, value_head_arch_spec)
         if self.rank == 0:
             print(f"Critic model config after override: {critic_model_config}")
 

@@ -39,10 +39,14 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
 )
+from transformers.modeling_utils import load_state_dict
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 
 from verl.models.registry import ModelRegistry
+from verl.trainer.ppo.value_categorical import extract_value_head_architecture_spec
 from verl.utils.import_utils import is_trl_available
+from verl.utils.recurrent_value_head import StatefulValueHead, patch_recurrent_value_head
 
 
 class LambdaLayer(nn.Module):
@@ -618,9 +622,60 @@ def patch_valuehead_model(model) -> None:
     model._no_split_modules = getattr(model.pretrained_model, "_no_split_modules", [])
 
 
-def _find_value_head_linears(model: nn.Module) -> list[tuple[str, nn.Linear]]:
-    """Find linear modules that act as critic/value heads across supported model variants."""
-    value_heads: list[tuple[str, nn.Linear]] = []
+def _resolve_hf_checkpoint_files(local_path: str) -> list[str]:
+    for index_name in (SAFE_WEIGHTS_INDEX_NAME, WEIGHTS_INDEX_NAME):
+        index_path = os.path.join(local_path, index_name)
+        if os.path.isfile(index_path):
+            with open(index_path) as f:
+                weight_map = json.load(f)["weight_map"]
+            shard_names = list(dict.fromkeys(weight_map.values()))
+            return [os.path.join(local_path, shard_name) for shard_name in shard_names]
+
+    for weight_name in (SAFE_WEIGHTS_NAME, WEIGHTS_NAME):
+        weight_path = os.path.join(local_path, weight_name)
+        if os.path.isfile(weight_path):
+            return [weight_path]
+
+    raise ValueError(
+        f"Can't find model weights in {local_path}. Expected one of "
+        f"{SAFE_WEIGHTS_NAME}, {WEIGHTS_NAME}, {SAFE_WEIGHTS_INDEX_NAME}, or {WEIGHTS_INDEX_NAME}."
+    )
+
+
+def _load_hf_checkpoint_weights(model: nn.Module, local_path: str, *, strict: bool = False) -> tuple[list[str], list[str]]:
+    checkpoint_files = _resolve_hf_checkpoint_files(local_path)
+    assign = any(tensor.is_meta for tensor in model.state_dict().values())
+    model_keys = set(model.state_dict().keys())
+    loaded_keys: set[str] = set()
+    unexpected_keys: set[str] = set()
+
+    for checkpoint_file in checkpoint_files:
+        state_dict = load_state_dict(checkpoint_file)
+        loaded_keys.update(state_dict.keys())
+        _, shard_unexpected = model.load_state_dict(state_dict, strict=False, assign=assign)
+        unexpected_keys.update(shard_unexpected)
+
+    missing_keys = sorted(model_keys - loaded_keys)
+    unexpected_keys_sorted = sorted(unexpected_keys)
+    if strict and (missing_keys or unexpected_keys_sorted):
+        raise RuntimeError(
+            f"Failed to strictly load model weights from {local_path}. "
+            f"missing_keys={missing_keys}, unexpected_keys={unexpected_keys_sorted}"
+        )
+    return missing_keys, unexpected_keys_sorted
+
+
+def _read_value_head_architecture_spec_from_path(local_path: str, trust_remote_code: bool):
+    try:
+        saved_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+    except Exception:
+        return None
+    return extract_value_head_architecture_spec(saved_config)
+
+
+def _find_value_head_modules(model: nn.Module) -> list[tuple[str, nn.Module]]:
+    """Find modules that act as critic/value heads across supported model variants."""
+    value_heads: list[tuple[str, nn.Module]] = []
 
     v_head = getattr(model, "v_head", None)
     if isinstance(v_head, nn.Linear):
@@ -632,10 +687,10 @@ def _find_value_head_linears(model: nn.Module) -> list[tuple[str, nn.Linear]]:
 
     for attr_name in ("score", "classifier"):
         module = getattr(model, attr_name, None)
-        if isinstance(module, nn.Linear):
+        if isinstance(module, (nn.Linear, StatefulValueHead)):
             value_heads.append((attr_name, module))
 
-    deduped: list[tuple[str, nn.Linear]] = []
+    deduped: list[tuple[str, nn.Module]] = []
     seen_module_ids: set[int] = set()
     for name, module in value_heads:
         module_id = id(module)
@@ -646,28 +701,43 @@ def _find_value_head_linears(model: nn.Module) -> list[tuple[str, nn.Linear]]:
     return deduped
 
 
+def _init_stateful_value_head_parameters(module: StatefulValueHead, mean: float, std: float) -> None:
+    for param in module.value_head_parameters():
+        if param is None:
+            continue
+        if std == 0:
+            nn.init.constant_(param, mean)
+        else:
+            nn.init.normal_(param, mean=mean, std=std)
+
+
 def _init_value_head_parameters(model: nn.Module, mean: float, std: float) -> None:
     if std < 0:
         raise ValueError(f"value_head_init_std must be >= 0, got {std}")
 
-    value_heads = _find_value_head_linears(model)
+    value_heads = _find_value_head_modules(model)
     if not value_heads:
         warnings.warn(
-            "value_head_init_std is set but no value-head linear module was found. "
+            "value_head_init_std is set but no supported value-head module was found. "
             "Supported names are: v_head(.summary), score, classifier.",
             stacklevel=2,
         )
         return
 
     for _, module in value_heads:
-        if std == 0:
-            nn.init.constant_(module.weight, mean)
-            if module.bias is not None:
-                nn.init.constant_(module.bias, mean)
+        if isinstance(module, nn.Linear):
+            if std == 0:
+                nn.init.constant_(module.weight, mean)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, mean)
+            else:
+                nn.init.normal_(module.weight, mean=mean, std=std)
+                if module.bias is not None:
+                    nn.init.normal_(module.bias, mean=mean, std=std)
+        elif isinstance(module, StatefulValueHead):
+            _init_stateful_value_head_parameters(module, mean=mean, std=std)
         else:
-            nn.init.normal_(module.weight, mean=mean, std=std)
-            if module.bias is not None:
-                nn.init.normal_(module.bias, mean=mean, std=std)
+            raise TypeError(f"Unsupported value-head module type: {type(module).__name__}")
 
 
 def load_valuehead_model(
@@ -680,18 +750,43 @@ def load_valuehead_model(
 ):
     from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
 
+    head_arch_spec = extract_value_head_architecture_spec(model_config)
+    saved_head_arch_spec = _read_value_head_architecture_spec_from_path(local_path, trust_remote_code)
+    if (
+        saved_head_arch_spec is not None
+        and saved_head_arch_spec.is_recurrent()
+        and (
+            saved_head_arch_spec.architecture != head_arch_spec.architecture
+            or saved_head_arch_spec.recurrent_state_size != head_arch_spec.recurrent_state_size
+        )
+    ):
+        raise ValueError(
+            "The checkpoint at "
+            f"{local_path} was saved with critic.value_head_architecture={saved_head_arch_spec.architecture} "
+            f"(state_size={saved_head_arch_spec.recurrent_state_size}), but the current config requests "
+            f"{head_arch_spec.architecture} (state_size={head_arch_spec.recurrent_state_size})."
+        )
+
     try:
-        model = AutoModelForTokenClassification.from_pretrained(
-            pretrained_model_name_or_path=local_path,
-            torch_dtype=torch_dtype,
+        model = AutoModelForTokenClassification.from_config(
             config=model_config,
-            attn_implementation="flash_attention_2",
             trust_remote_code=trust_remote_code,
         )
-        if value_head_init_std is not None:
+        patch_recurrent_value_head(model, head_arch_spec)
+        strict_load = saved_head_arch_spec is not None and saved_head_arch_spec.is_recurrent()
+        _load_hf_checkpoint_weights(model, local_path, strict=strict_load)
+        if value_head_init_std is not None and not (
+            saved_head_arch_spec is not None and saved_head_arch_spec.is_recurrent()
+        ):
             _init_value_head_parameters(model=model, mean=value_head_init_mean, std=value_head_init_std)
         return model
     except BaseException as e:
+        if head_arch_spec.is_recurrent():
+            raise RuntimeError(
+                "Stateful critic heads currently require a HuggingFace token-classification model path. "
+                "TRL AutoModelForCausalLMWithValueHead fallback is not supported for "
+                f"critic.value_head_architecture={head_arch_spec.architecture}."
+            ) from e
         if not is_trl_available():
             raise RuntimeError(
                 f"model({local_path}) is not a value head model, please install trl to make it valid"

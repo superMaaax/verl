@@ -31,6 +31,7 @@ from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
+from verl.utils.recurrent_value_head import StatefulValueHead
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.torch_functional import masked_mean
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
@@ -56,6 +57,14 @@ class DataParallelPPOCritic(BasePPOCritic):
 
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
         self.device_name = get_device_name()
+
+    def _collect_stateful_value_head_metrics(self) -> dict[str, float]:
+        for module in self.critic_module.modules():
+            if isinstance(module, StatefulValueHead):
+                metrics = module.get_debug_metrics()
+                module.clear_debug_metrics()
+                return metrics
+        return {}
 
     def _forward_micro_batch(self, micro_batch):
         is_categorical_value = self.value_spec.is_categorical()
@@ -292,6 +301,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                             "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
                         }
                     )
+                    micro_batch_metrics.update(self._collect_stateful_value_head_metrics())
                     for metric_name, metric_value in categorical_metrics.items():
                         if isinstance(metric_value, torch.Tensor):
                             metric_value = metric_value.detach().item()

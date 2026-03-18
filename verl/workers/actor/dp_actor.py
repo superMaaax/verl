@@ -620,6 +620,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
+                        sum_pi_squared=outputs.get("sum_pi_squared", None),
                     )
                     micro_batch_metrics.update(pg_metrics)
 

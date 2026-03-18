@@ -52,7 +52,8 @@ PolicyLossFn = Callable[
         torch.Tensor,  # response_mask
         str,  # loss_agg_mode
         Optional[DictConfig | ActorConfig],  # config
-        torch.Tensor | None,  # rollout_log_probs
+        torch.Tensor | None,  # rollout_is_weights
+        torch.Tensor | None,  # sum_pi_squared
     ],
     tuple[torch.Tensor, dict[str, Any]],
 ]
@@ -1099,6 +1100,109 @@ def agg_loss(
     return loss
 
 
+def _to_metric_tensor(value: int | float | torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device=like.device, dtype=like.dtype)
+    return torch.as_tensor(value, device=like.device, dtype=like.dtype)
+
+
+def _compute_vanilla_policy_gradient_logit_metrics(
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    ratio: torch.Tensor,
+    cliprange_low: float,
+    cliprange_high: float,
+    clip_ratio_c: float,
+    loss_agg_mode: str,
+    config: Optional[ActorConfig],
+    rollout_is_weights: torch.Tensor | None,
+    sum_pi_squared: torch.Tensor | None,
+) -> dict[str, float]:
+    """Compute low-overhead current-policy PPO diagnostics in response-logit space.
+
+    These metrics are exact with respect to the gradient of the PPO objective
+    w.r.t. the response logits. They remain a proxy for parameter-space policy
+    gradient variance because they do not include the model Jacobian.
+    """
+    if sum_pi_squared is None:
+        return {}
+
+    with torch.no_grad():
+        response_mask_f = response_mask.to(dtype=log_prob.dtype)
+        valid_seq_mask = response_mask_f.sum(dim=-1) > 0
+
+        ratio_detached = ratio.detach()
+        advantages_detached = advantages.detach()
+        score_norm = torch.clamp(
+            1.0 - 2.0 * torch.exp(log_prob.detach()) + sum_pi_squared.detach(),
+            min=0.0,
+        )
+
+        grad_coeff = -advantages_detached * ratio_detached
+        if rollout_is_weights is not None:
+            grad_coeff = grad_coeff * rollout_is_weights.detach()
+
+        positive_active = (advantages_detached >= 0) & (ratio_detached <= (1.0 + cliprange_high))
+        negative_active = (advantages_detached < 0) & (ratio_detached >= (1.0 - cliprange_low))
+        negative_active = negative_active & (ratio_detached <= clip_ratio_c)
+        active_mask = (positive_active | negative_active).to(dtype=log_prob.dtype)
+        grad_coeff = grad_coeff * active_mask
+
+        seq_coeff = grad_coeff
+        seq_token_counts = torch.clamp(response_mask_f.sum(dim=-1, keepdim=True), min=1.0)
+        if loss_agg_mode == "seq-mean-token-mean":
+            seq_coeff = seq_coeff / seq_token_counts
+
+        per_seq_logit_power = torch.sum(seq_coeff.square() * score_norm * response_mask_f, dim=-1)
+        if valid_seq_mask.any():
+            pg_variance_logit_proxy = per_seq_logit_power[valid_seq_mask].mean()
+        else:
+            pg_variance_logit_proxy = log_prob.new_zeros(())
+
+        batch_info = config.global_batch_info if config is not None and hasattr(config, "global_batch_info") else {}
+        dp_size = _to_metric_tensor(batch_info.get("dp_size", 1), log_prob)
+
+        if loss_agg_mode == "token-mean":
+            batch_num_tokens = batch_info.get("batch_num_tokens", None)
+            if batch_num_tokens is None:
+                batch_num_tokens = torch.clamp(response_mask_f.sum(), min=1.0)
+            batch_coeff = grad_coeff * (dp_size / torch.clamp(_to_metric_tensor(batch_num_tokens, log_prob), min=1.0))
+        elif loss_agg_mode == "seq-mean-token-sum":
+            global_batch_size = batch_info.get("global_batch_size", None)
+            if global_batch_size is None:
+                global_batch_size = torch.clamp(valid_seq_mask.to(dtype=log_prob.dtype).sum(), min=1.0)
+            batch_coeff = grad_coeff * (
+                dp_size / torch.clamp(_to_metric_tensor(global_batch_size, log_prob), min=1.0)
+            )
+        elif loss_agg_mode == "seq-mean-token-mean":
+            global_batch_size = batch_info.get("global_batch_size", None)
+            if global_batch_size is None:
+                global_batch_size = torch.clamp(valid_seq_mask.to(dtype=log_prob.dtype).sum(), min=1.0)
+            batch_coeff = seq_coeff * (dp_size / torch.clamp(_to_metric_tensor(global_batch_size, log_prob), min=1.0))
+        elif loss_agg_mode == "seq-mean-token-sum-norm":
+            loss_scale_factor = batch_info.get("loss_scale_factor", None)
+            if loss_scale_factor is None and config is not None:
+                loss_scale_factor = config.loss_scale_factor
+            if loss_scale_factor is None:
+                raise ValueError(
+                    "loss_scale_factor is required to log PG variance for "
+                    'loss_agg_mode="seq-mean-token-sum-norm".'
+                )
+            batch_coeff = grad_coeff * (dp_size / torch.clamp(_to_metric_tensor(loss_scale_factor, log_prob), min=1.0))
+        else:
+            raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
+
+        pg_logit_batch_grad_norm_sq = torch.sum(batch_coeff.square() * score_norm * response_mask_f)
+        pg_logit_batch_grad_norm = torch.sqrt(torch.clamp(pg_logit_batch_grad_norm_sq, min=0.0))
+
+    return {
+        "actor/pg_variance_logit_proxy": pg_variance_logit_proxy.detach().item(),
+        "actor/pg_logit_batch_grad_norm_sq": pg_logit_batch_grad_norm_sq.detach().item(),
+        "actor/pg_logit_batch_grad_norm": pg_logit_batch_grad_norm.detach().item(),
+    }
+
+
 @deprecated("verl.trainer.ppo.core_algos.compute_policy_loss_vanilla")
 def compute_policy_loss(
     old_log_prob,
@@ -1184,6 +1288,7 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    sum_pi_squared: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -1204,8 +1309,12 @@ def compute_policy_loss_vanilla(
             Aggregation mode for `agg_loss`. Defaults to "token-mean".
         config: `(verl.trainer.config.ActorConfig)`:
             config for the actor.
-        rollout_log_probs: `(torch.Tensor)`:
-            log probabilities of actions under the rollout policy, shape (batch_size, response_length).
+        rollout_is_weights: `(torch.Tensor)`:
+            Optional importance weights already computed by the trainer, shape
+            (batch_size, response_length).
+        sum_pi_squared: `(torch.Tensor)`:
+            Current-policy `sum(prob**2)` for each response token, used only for
+            logit-space PG variance logging.
     """
 
     assert config is not None
@@ -1266,6 +1375,21 @@ def compute_policy_loss_vanilla(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    pg_metrics.update(
+        _compute_vanilla_policy_gradient_logit_metrics(
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            ratio=ratio,
+            cliprange_low=cliprange_low,
+            cliprange_high=cliprange_high,
+            clip_ratio_c=clip_ratio_c,
+            loss_agg_mode=loss_agg_mode,
+            config=config,
+            rollout_is_weights=rollout_is_weights,
+            sum_pi_squared=sum_pi_squared,
+        )
+    )
     return pg_loss, pg_metrics
 
 
@@ -1278,6 +1402,7 @@ def compute_policy_loss_gspo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    sum_pi_squared: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -1354,6 +1479,7 @@ def compute_policy_loss_sapo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    sum_pi_squared: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the smoothed policy objective and related metrics for SAPO.
@@ -1439,6 +1565,7 @@ def compute_policy_loss_gpg(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    sum_pi_squared: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Adapted from
     https://github.com/AMAP-ML/GPG/blob/main/VisualThinker-R1-Zero/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py#L495
@@ -1475,6 +1602,7 @@ def compute_policy_loss_clip_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    sum_pi_squared: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1580,6 +1708,7 @@ def compute_policy_loss_kl_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    sum_pi_squared: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1660,6 +1789,7 @@ def compute_policy_loss_geo_mean(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    sum_pi_squared: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for GMPO.
@@ -1746,6 +1876,7 @@ def compute_policy_loss_cispo(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    sum_pi_squared: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for CISPO.
@@ -2068,6 +2199,7 @@ def compute_policy_loss_reinforce(
     loss_agg_mode: str = "seq-mean-token-sum",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: Optional[torch.Tensor] = None,
+    sum_pi_squared: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Compute REINFORCE-style policy gradient loss with optional IS correction.
 
@@ -2149,6 +2281,7 @@ def compute_policy_loss_bypass_mode(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    sum_pi_squared: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Bypass mode policy loss supporting both REINFORCE and PPO-clip.
 
@@ -2268,6 +2401,7 @@ def compute_policy_loss_bypass_mode(
             loss_agg_mode=loss_agg_mode,
             config=config,
             rollout_is_weights=None,  # Explicitly None - no IS weights for PPO-clip
+            sum_pi_squared=sum_pi_squared,
         )
 
     else:

@@ -287,6 +287,7 @@ class FSDPActorConfig(ActorConfig):
         entropy_checkpointing (bool): Whether to use gradient checkpointing for entropy computation.
         fsdp_config (dict[str, Any]): Configuration for FSDP settings.
         use_remove_padding (bool): Whether to remove padding tokens in inputs during training
+        calculate_sum_pi_squared (bool): Whether to compute Σπ² for OTB and PG variance logging.
     """
 
     strategy: str = "fsdp"

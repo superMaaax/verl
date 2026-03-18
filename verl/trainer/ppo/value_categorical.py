@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 
 SUPPORTED_VALUE_HEAD_TYPES = {"scalar", "categorical"}
+SUPPORTED_VALUE_HEAD_ARCHITECTURES = {"linear", "gru", "gated_carry"}
 SUPPORTED_VALUE_TARGET_TYPES = {"two_hot", "hl_gauss", "one_hot"}
 SUPPORTED_VALUE_TARGET_SCALING = {"identity", "affine"}
 SUPPORTED_VALUE_RANGE_BEHAVIOR = {"error", "warn", "clip"}
@@ -114,6 +115,33 @@ class ValueHeadSpec:
         return edges
 
 
+@dataclass(frozen=True)
+class ValueHeadArchitectureSpec:
+    architecture: str = "linear"
+    gru_hidden_size: int = 256
+    state_size: int | None = None
+
+    @property
+    def recurrent_state_size(self) -> int:
+        return self.gru_hidden_size if self.state_size is None else self.state_size
+
+    def validate(self) -> None:
+        if self.architecture not in SUPPORTED_VALUE_HEAD_ARCHITECTURES:
+            raise ValueError(
+                "value_head_architecture must be one of "
+                f"{sorted(SUPPORTED_VALUE_HEAD_ARCHITECTURES)}, got {self.architecture}"
+            )
+
+        if self.is_recurrent() and self.recurrent_state_size <= 0:
+            raise ValueError(
+                "value_head_state_size/value_head_gru_hidden_size must be > 0, "
+                f"got {self.recurrent_state_size}"
+            )
+
+    def is_recurrent(self) -> bool:
+        return self.architecture in {"gru", "gated_carry"}
+
+
 def extract_value_head_spec(config: Any) -> ValueHeadSpec:
     hl_gauss_sigma = _get_config_value(config, "value_hl_gauss_sigma", None)
     if hl_gauss_sigma is not None:
@@ -136,6 +164,20 @@ def extract_value_head_spec(config: Any) -> ValueHeadSpec:
     return spec
 
 
+def extract_value_head_architecture_spec(config: Any) -> ValueHeadArchitectureSpec:
+    state_size = _get_config_value(config, "value_head_state_size", None)
+    if state_size is not None:
+        state_size = int(state_size)
+
+    spec = ValueHeadArchitectureSpec(
+        architecture=_get_config_value(config, "value_head_architecture", "linear"),
+        gru_hidden_size=int(_get_config_value(config, "value_head_gru_hidden_size", 256)),
+        state_size=state_size,
+    )
+    spec.validate()
+    return spec
+
+
 def apply_value_head_spec_to_hf_config(hf_config: Any, spec: ValueHeadSpec) -> None:
     # Persist value-head settings on HF config so model-engine workers can access them.
     setattr(hf_config, "value_head_type", spec.head_type)
@@ -150,6 +192,13 @@ def apply_value_head_spec_to_hf_config(hf_config: Any, spec: ValueHeadSpec) -> N
     setattr(hf_config, "value_target_scale_max", spec.target_scale_max)
     setattr(hf_config, "value_target_out_of_range", spec.target_out_of_range)
     setattr(hf_config, "num_labels", spec.num_bins if spec.is_categorical() else 1)
+
+
+def apply_value_head_architecture_spec_to_hf_config(hf_config: Any, spec: ValueHeadArchitectureSpec) -> None:
+    recurrent_state_size = spec.recurrent_state_size if spec.is_recurrent() else spec.gru_hidden_size
+    setattr(hf_config, "value_head_architecture", spec.architecture)
+    setattr(hf_config, "value_head_gru_hidden_size", recurrent_state_size)
+    setattr(hf_config, "value_head_state_size", spec.recurrent_state_size if spec.is_recurrent() else spec.state_size)
 
 
 def value_logits_to_probs(logits: torch.Tensor) -> torch.Tensor:

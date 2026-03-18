@@ -244,6 +244,8 @@ def compute_score(
     ground_truth: str,
     strict_box_verify: bool = False,
     pause_tokens_index: Optional[list[int]] = None,
+    correct_reward: float = 1.0,
+    incorrect_reward: float = -1.0,
 ) -> float:
     """Compute the reward score for a solution.
 
@@ -254,7 +256,7 @@ def compute_score(
         pause_tokens_index: Indices of pause tokens
 
     Returns:
-        Reward score (1.0 for correct, -1.0 for incorrect)
+        Reward score with configurable values for correct and incorrect responses.
     """
     # Limit solution length for efficiency
     solution_str = solution_str[-300:]  # The longest answer in MATH-500 has 159 characters
@@ -262,7 +264,7 @@ def compute_score(
     # Verify the solution
     correct, pred = verify(solution_str, ground_truth, strict_box_verify, pause_tokens_index)
 
-    reward = 1.0 if correct else -1.0
+    reward = correct_reward if correct else incorrect_reward
     acc = correct
 
     return {

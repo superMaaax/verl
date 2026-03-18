@@ -24,6 +24,11 @@ def default_compute_score(
     sandbox_fusion_url=None,
     concurrent_semaphore=None,
     memory_limit_mb=None,
+    math_dapo_binary_reward: bool = False,
+    math_dapo_correct_reward: float = 1.0,
+    math_dapo_incorrect_reward: float | None = None,
+    math_dapo_strict_box_verify: bool = False,
+    math_dapo_pause_tokens_index=None,
     **kwargs,
 ):
     """Compute the score for a given solution based on the data source.
@@ -45,7 +50,7 @@ def default_compute_score(
         from . import gsm8k
 
         res = gsm8k.compute_score(solution_str, ground_truth)
-    elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
+    elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500", "math_500"]:
         from . import math_reward
 
         res = math_reward.compute_score(solution_str, ground_truth)
@@ -59,7 +64,17 @@ def default_compute_score(
     elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
         from . import math_dapo
 
-        res = math_dapo.compute_score(solution_str, ground_truth)
+        if math_dapo_incorrect_reward is None:
+            math_dapo_incorrect_reward = 0.0 if math_dapo_binary_reward else -1.0
+
+        res = math_dapo.compute_score(
+            solution_str,
+            ground_truth,
+            strict_box_verify=math_dapo_strict_box_verify,
+            pause_tokens_index=math_dapo_pause_tokens_index,
+            correct_reward=math_dapo_correct_reward,
+            incorrect_reward=math_dapo_incorrect_reward,
+        )
     elif data_source in [
         "numina_aops_forum",
         "numina_synthetic_math",

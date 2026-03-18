@@ -19,7 +19,12 @@ from typing import Optional
 from omegaconf import MISSING
 
 from verl.base_config import BaseConfig
-from verl.trainer.ppo.value_categorical import ValueHeadSpec, apply_value_head_spec_to_hf_config
+from verl.trainer.ppo.value_categorical import (
+    ValueHeadSpec,
+    apply_value_head_architecture_spec_to_hf_config,
+    apply_value_head_spec_to_hf_config,
+    extract_value_head_architecture_spec,
+)
 from verl.trainer.config import BaseModelConfig, CheckpointConfig
 from verl.utils.profiler import ProfilerConfig
 
@@ -51,6 +56,10 @@ class CriticConfig(BaseConfig):
         shuffle (bool): Shuffle training data across PPO epochs.
         cliprange_value (float): PPO value function clipping range.
         value_head_type (str): Critic value head type, "scalar" or "categorical".
+        value_head_architecture (str): Critic head architecture, "linear", "gru", or "gated_carry".
+        value_head_state_size (Optional[int]): Hidden size for recurrent critic state when using a stateful head.
+        value_head_gru_hidden_size (int): Backward-compatible alias for GRU hidden size when
+            value_head_state_size is not set.
         value_num_bins (int): Number of bins for categorical value head.
         value_min (float): Minimum value in categorical support.
         value_max (float): Maximum value in categorical support.
@@ -90,6 +99,9 @@ class CriticConfig(BaseConfig):
     shuffle: bool = True
     cliprange_value: float = 0.5
     value_head_type: str = "scalar"
+    value_head_architecture: str = "linear"
+    value_head_state_size: Optional[int] = None
+    value_head_gru_hidden_size: int = 256
     value_num_bins: int = 11
     value_min: float = 0.0
     value_max: float = 1.0
@@ -138,8 +150,16 @@ class CriticConfig(BaseConfig):
             target_out_of_range=self.value_target_out_of_range,
         )
         value_spec.validate()
+        value_head_arch_spec = extract_value_head_architecture_spec(self)
         # Keep HF model config synchronized with critic head setup.
         apply_value_head_spec_to_hf_config(self.model_config.hf_config, value_spec)
+        apply_value_head_architecture_spec_to_hf_config(self.model_config.hf_config, value_head_arch_spec)
+
+        if value_head_arch_spec.is_recurrent() and self.strategy not in {"fsdp", "fsdp2"}:
+            raise ValueError(
+                f"critic.value_head_architecture={value_head_arch_spec.architecture} is currently supported "
+                "only for critic.strategy in {'fsdp', 'fsdp2'}."
+            )
 
         if not self.use_dynamic_bsz:
             self._check_mutually_exclusive(self.ppo_micro_batch_size, self.ppo_micro_batch_size_per_gpu, "critic")
@@ -244,6 +264,13 @@ class FSDPCriticConfig(CriticConfig):
         super().__post_init__()
 
         if self.strategy in {"fsdp", "fsdp2"}:
+            value_head_arch_spec = extract_value_head_architecture_spec(self)
+            if value_head_arch_spec.is_recurrent() and self.ulysses_sequence_parallel_size > 1:
+                raise ValueError(
+                    f"critic.value_head_architecture={value_head_arch_spec.architecture} is not supported with "
+                    "critic.ulysses_sequence_parallel_size > 1 because the recurrent critic state "
+                    "cannot be propagated across sequence-parallel shards."
+                )
             if self.ulysses_sequence_parallel_size > 1:
                 if not self.model.get("use_remove_padding", False):
                     raise ValueError(

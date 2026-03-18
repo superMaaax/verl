@@ -3,16 +3,17 @@ export VLLM_USE_V1=0
 export HYDRA_FULL_ERROR=0
 export VLLM_USE_V1=1
 export WANDB_PROJECT="PPO_midi"
-export SLURM_JOB_ID="05b_vh_init_load_c1100_e5_freeze_critic_lvl5_test"
+export SLURM_JOB_ID="05b_vh_init_e5_gated_carry"
 
-CRITIC_INIT_CKPT=/data/shuozhe/verl/train_log/job_05b_vh_init_e5/global_step_1100/merged_hf/critic
+# When true, math_dapo incorrect answers get reward 0.0 instead of -1.0.
+MATH_DAPO_BINARY_REWARD=true
 
   # data.train_files=/data/shuozhe/saved_dataset/verl_math_7500_500_5000/train.parquet \
   # data.val_files=/data/shuozhe/saved_dataset/verl_math_7500_500_5000/test.parquet \
 
 python3 -m verl.trainer.main_ppo \
-  data.train_files=/data/shuozhe/saved_dataset/verl_math_7500_500_5000_level_5/train.parquet \
-  data.val_files=/data/shuozhe/saved_dataset/verl_math_7500_500_5000_level_5/test_5000.parquet \
+  data.train_files=/data/shuozhe/saved_dataset/MetaMathQA-math-500/train.parquet \
+  data.val_files=/data/shuozhe/saved_dataset/MetaMathQA-math-500/test.parquet \
   data.prompt_key=prompt \
   +data.response_key=ground_truth \
   data.train_batch_size=32 \
@@ -24,6 +25,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
   actor_rollout_ref.actor.fsdp_config.param_offload=False \
   actor_rollout_ref.actor.use_kl_loss=False \
+  actor_rollout_ref.actor.calculate_sum_pi_squared=True \
   actor_rollout_ref.ref.fsdp_config.param_offload=True \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
@@ -36,22 +38,25 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
   actor_rollout_ref.hybrid_engine=True \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
-  critic.optim.lr=0.0 \
-  critic.ppo_epochs=0 \
-  critic.model.path=${CRITIC_INIT_CKPT} \
+  critic.optim.lr=1e-5 \
+  critic.value_head_architecture=gated_carry \
+  critic.value_head_state_size=256 \
+  critic.model.path=/data/shuozhe/saved_model/Qwen2.5-0.5B \
   critic.model.external_lib=trl \
+  critic.model.value_head_init_mean=0.0 \
+  critic.model.value_head_init_std=0.00001 \
   critic.model.fsdp_config.param_offload=False \
   critic.ppo_micro_batch_size_per_gpu=4 \
-  trainer.resume_mode=disable \
-  trainer.critic_warmup=0 \
+  trainer.use_legacy_worker_impl=enable \
   trainer.val_before_train=True \
   trainer.n_gpus_per_node=4 \
   trainer.nnodes=1 \
-  trainer.test_freq=5 \
-  trainer.save_freq=10 \
+  trainer.test_freq=50 \
+  trainer.save_freq=50 \
   trainer.total_epochs=5 \
   trainer.logger='["console","wandb"]' \
-  trainer.project_name="PPO" \
-  trainer.experiment_name="qwen2.5_0.5B_ppo_valuehead_${SLURM_JOB_ID}" \
+  trainer.project_name="PPO_metamath" \
+  trainer.experiment_name="qwen2.5_${SLURM_JOB_ID}" \
+  +reward.reward_kwargs.math_dapo_binary_reward=${MATH_DAPO_BINARY_REWARD} \
   trainer.default_local_dir="/data/shuozhe/verl/train_log/job_${SLURM_JOB_ID}" \
   2>&1 | tee /data/shuozhe/verl/train_log/job_${SLURM_JOB_ID}.txt

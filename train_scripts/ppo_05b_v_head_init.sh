@@ -3,14 +3,17 @@ export VLLM_USE_V1=0
 export HYDRA_FULL_ERROR=0
 export VLLM_USE_V1=1
 export WANDB_PROJECT="PPO_midi"
-export SLURM_JOB_ID="05b_vh_init_e5_new_lvl5"
+export SLURM_JOB_ID="05b_vh_init_e5_metamath"
+
+# When true, math_dapo incorrect answers get reward 0.0 instead of -1.0.
+MATH_DAPO_BINARY_REWARD=true
 
   # data.train_files=/data/shuozhe/saved_dataset/verl_math_7500_500_5000/train.parquet \
   # data.val_files=/data/shuozhe/saved_dataset/verl_math_7500_500_5000/test.parquet \
 
 python3 -m verl.trainer.main_ppo \
-  data.train_files=/data/shuozhe/saved_dataset/verl_math_7500_500_5000_level_5/train.parquet \
-  data.val_files=/data/shuozhe/saved_dataset/verl_math_7500_500_5000_level_5/test_5000.parquet \
+  data.train_files=/data/shuozhe/saved_dataset/MetaMathQA-math-500/train.parquet \
+  data.val_files=/data/shuozhe/saved_dataset/MetaMathQA-math-500/test.parquet \
   data.prompt_key=prompt \
   +data.response_key=ground_truth \
   data.train_batch_size=32 \
@@ -41,6 +44,7 @@ python3 -m verl.trainer.main_ppo \
   critic.model.value_head_init_std=0.00001 \
   critic.model.fsdp_config.param_offload=False \
   critic.ppo_micro_batch_size_per_gpu=4 \
+  +reward.reward_kwargs.math_dapo_binary_reward=${MATH_DAPO_BINARY_REWARD} \
   trainer.val_before_train=True \
   trainer.n_gpus_per_node=4 \
   trainer.nnodes=1 \
@@ -48,7 +52,7 @@ python3 -m verl.trainer.main_ppo \
   trainer.save_freq=50 \
   trainer.total_epochs=5 \
   trainer.logger='["console","wandb"]' \
-  trainer.project_name="PPO" \
+  trainer.project_name="PPO_metamath" \
   trainer.experiment_name="qwen2.5_0.5B_ppo_valuehead_${SLURM_JOB_ID}" \
   trainer.default_local_dir="/data/shuozhe/verl/train_log/job_${SLURM_JOB_ID}" \
   2>&1 | tee /data/shuozhe/verl/train_log/job_${SLURM_JOB_ID}.txt

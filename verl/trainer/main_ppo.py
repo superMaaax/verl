@@ -45,6 +45,24 @@ def main(config):
     run_ppo(config)
 
 
+def _validate_recurrent_critic_runtime_support(config) -> None:
+    if not need_critic(config):
+        return
+
+    from verl.trainer.ppo.value_categorical import extract_value_head_architecture_spec
+
+    head_arch_spec = extract_value_head_architecture_spec(OmegaConf.select(config, "critic", default={}))
+    if not head_arch_spec.is_recurrent():
+        return
+
+    if config.trainer.get("use_legacy_worker_impl", "auto") == "disable":
+        raise ValueError(
+            f"critic.value_head_architecture={head_arch_spec.architecture} is currently supported only by the "
+            "legacy FSDP critic worker. "
+            "Set trainer.use_legacy_worker_impl to 'auto' or 'enable'."
+        )
+
+
 # Define a function to run the PPO-like training process
 def run_ppo(config, task_runner_class=None) -> None:
     """Initialize Ray cluster and run distributed PPO training process.
@@ -55,6 +73,8 @@ def run_ppo(config, task_runner_class=None) -> None:
                 model paths, and training hyperparameters.
         task_runner_class: For recipe to change TaskRunner.
     """
+    _validate_recurrent_critic_runtime_support(config)
+
     # Check if Ray is not initialized
     if not ray.is_initialized():
         # Initialize Ray with a local cluster configuration

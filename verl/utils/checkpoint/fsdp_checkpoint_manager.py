@@ -247,6 +247,22 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     torch.save(extra_state_dict, extra_path)
                     log_with_rank(f"Saved extra_state to {os.path.abspath(extra_path)}", rank=self.rank, logger=logger)
 
+        if self.should_save_hf_model:
+            if fsdp_version(self.model) == 1:
+                unwrap_model = self.model._fsdp_wrapped_module
+            else:
+                unwrap_model = self.model
+
+            from verl.trainer.ppo.value_categorical import extract_value_head_architecture_spec
+
+            value_head_arch_spec = extract_value_head_architecture_spec(unwrap_model.config)
+            if value_head_arch_spec.is_recurrent():
+                raise NotImplementedError(
+                    "checkpoint.save_contents=['hf_model'] is not supported for stateful critic heads "
+                    f"(critic.value_head_architecture={value_head_arch_spec.architecture}). Use the default "
+                    "sharded ['model', 'optimizer', 'extra'] checkpoint contents instead."
+                )
+
         if self.rank == 0:
             # Save HF tokenizer/processor and model config on rank 0 to huggingface/ directory, no matter whether
             # huggingface model is requested to be saved or not.
@@ -339,6 +355,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     save_model = auto_model_cls.from_config(
                         model_config, torch_dtype=torch.bfloat16, trust_remote_code=self.trust_remote_code
                     )
+                    from verl.trainer.ppo.value_categorical import extract_value_head_architecture_spec
+                    from verl.utils.recurrent_value_head import patch_recurrent_value_head
+
+                    patch_recurrent_value_head(save_model, extract_value_head_architecture_spec(model_config))
 
                 save_model.to_empty(device="cpu")
 

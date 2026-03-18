@@ -33,7 +33,11 @@ from torch.distributed.tensor import DTensor
 import verl.utils.torch_functional as verl_F
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.trainer.config import CheckpointConfig
-from verl.trainer.ppo.value_categorical import extract_value_head_spec, value_logits_to_scalar_expectation
+from verl.trainer.ppo.value_categorical import (
+    extract_value_head_architecture_spec,
+    extract_value_head_spec,
+    value_logits_to_scalar_expectation,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
@@ -1044,6 +1048,17 @@ class FSDPEngineWithValueHead(FSDPEngineWithLMHead):
     """
     The only difference between critic and actor is how the raw model output is processed
     """
+
+    def _build_module(self):
+        value_head_arch_spec = extract_value_head_architecture_spec(self.model_config.hf_config)
+        if value_head_arch_spec.is_recurrent():
+            raise NotImplementedError(
+                "Stateful critic heads "
+                f"(critic.value_head_architecture={value_head_arch_spec.architecture}) are not supported in the "
+                "TrainingWorker/new engine path yet. Use the legacy FSDP critic worker "
+                "(trainer.use_legacy_worker_impl=auto or enable)."
+            )
+        return super()._build_module()
 
     def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)

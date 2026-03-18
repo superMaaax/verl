@@ -22,6 +22,7 @@ from verl.trainer.ppo.rollout_corr_helper import (
     compute_offpolicy_metrics,
     compute_rollout_correction_and_rejection_mask,
 )
+from verl.utils.torch_functional import calculate_sum_pi_squared_from_logits
 from verl.workers.config.actor import ActorConfig
 
 
@@ -229,6 +230,49 @@ class TestRolloutISIntegration:
 
         # Losses should be different (weights have an effect)
         assert not torch.allclose(pg_loss_no_weights, pg_loss_with_weights)
+
+    def test_policy_loss_logs_exact_logit_gradient_norm(self, config_with_rollout_is):
+        """Test the logit-space PG metric against autograd on a small PPO example."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        logits = torch.tensor(
+            [
+                [[0.2, -0.1, 0.0], [1.0, 0.2, -0.7], [0.5, -0.4, 0.1]],
+                [[-0.3, 0.4, 0.8], [0.9, -0.2, 0.3], [0.1, 0.0, -0.2]],
+            ],
+            dtype=torch.float32,
+            device=device,
+            requires_grad=True,
+        )
+        responses = torch.tensor([[0, 1, 2], [2, 0, 1]], device=device)
+        log_prob = torch.log_softmax(logits, dim=-1).gather(-1, responses.unsqueeze(-1)).squeeze(-1)
+
+        log_ratio = torch.tensor([[0.5, -0.4, 0.1], [1.2, 0.7, -0.2]], dtype=torch.float32, device=device)
+        old_log_prob = log_prob.detach() - log_ratio
+        advantages = torch.tensor([[1.0, -1.5, 0.3], [-0.7, 2.0, -0.5]], dtype=torch.float32, device=device)
+        response_mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]], dtype=torch.float32, device=device)
+        sum_pi_squared = calculate_sum_pi_squared_from_logits(logits)
+
+        pg_loss, pg_metrics = compute_policy_loss_vanilla(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            loss_agg_mode="token-mean",
+            config=config_with_rollout_is,
+            sum_pi_squared=sum_pi_squared,
+        )
+
+        pg_loss.backward()
+        expected_grad_norm_sq = logits.grad.square().sum().item()
+
+        assert "actor/pg_variance_logit_proxy" in pg_metrics
+        assert pg_metrics["actor/pg_logit_batch_grad_norm_sq"] == pytest.approx(
+            expected_grad_norm_sq, rel=1e-5, abs=1e-7
+        )
+        assert pg_metrics["actor/pg_logit_batch_grad_norm"] == pytest.approx(
+            expected_grad_norm_sq**0.5, rel=1e-5, abs=1e-7
+        )
 
 
 class TestRolloutCorrectionConfigNormalization:

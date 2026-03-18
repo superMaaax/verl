@@ -82,6 +82,17 @@ cliprange_value: 0.5
 # Critic value head type: "scalar" or "categorical"
 value_head_type: scalar
 
+# Critic head architecture: "linear", "gru", or "gated_carry"
+value_head_architecture: linear
+
+# Hidden size for recurrent critic state when using "gru" or "gated_carry".
+# If null, fall back to value_head_gru_hidden_size for backward compatibility.
+value_head_state_size: null
+
+# Backward-compatible alias for GRU hidden size.
+# Ignored when value_head_state_size is set.
+value_head_gru_hidden_size: 256
+
 # Number of bins for categorical critic head
 value_num_bins: 11
 
