@@ -617,7 +617,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         metrics = self.metrics
         timing_raw = self.timing_raw
         # implement critic warmup
-        if self.config.trainer.critic_warmup <= self.global_steps:
+        if self._should_update_actor():
             # update actor
             with marked_timer("update_actor", timing_raw, color="red"):
                 actor_output = self._update_actor(batch)
@@ -628,7 +628,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
 
     def _fit_update_weights(self):
         timing_raw = self.timing_raw
-        if self.config.trainer.critic_warmup <= self.global_steps:
+        if self._should_update_actor():
             # update weights from trainer to rollout
             with marked_timer("update_weights", timing_raw, color="red"):
                 self.checkpoint_manager.update_weights()
@@ -702,6 +702,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
 
         # collect metrics
         metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+        self._maybe_add_zero_critic_metrics(metrics)
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         # TODO: implement actual tflpo and theoretical tflpo
         n_gpus = self.resource_pool_manager.get_n_gpus()

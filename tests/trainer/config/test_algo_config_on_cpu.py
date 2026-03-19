@@ -24,6 +24,7 @@ from verl.trainer.ppo.core_algos import (
     compute_grpo_outcome_advantage,
     get_adv_estimator_fn,
 )
+from verl.trainer.ppo.utils import need_critic
 from verl.utils.config import omega_conf_to_dataclass
 
 
@@ -123,6 +124,17 @@ class TestAlgoConfig(unittest.TestCase):
         self.assertIsNotNone(minimal_config.kl_ctrl)
         self.assertIsInstance(minimal_config.kl_ctrl, KLControlConfig)
         assert not minimal_config.pf_ppo
+
+    def test_zero_critic_disables_critic_even_if_enabled(self):
+        config = OmegaConf.create(
+            {
+                "algorithm": {"adv_estimator": "zero_critic"},
+                "critic": {"enable": True},
+            }
+        )
+
+        with self.assertWarns(UserWarning):
+            self.assertFalse(need_critic(config))
 
     def test_config_init_from_yaml(self):
         import os

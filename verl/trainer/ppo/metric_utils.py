@@ -313,6 +313,21 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
     }
 
 
+def compute_zero_critic_metrics() -> dict[str, float]:
+    """Metrics emitted when using a fixed zero value function instead of a critic."""
+    return {
+        "critic/vf_loss": 0.0,
+        "critic/vf_clipfrac": 0.0,
+        "critic/vf_explained_var": 0.0,
+        "critic/vpred_mean": 0.0,
+        "critic/values/mean": 0.0,
+        "critic/values/max": 0.0,
+        "critic/values/min": 0.0,
+        "critic/prompt_end_value/mean": 0.0,
+        "critic/grad_norm": 0.0,
+    }
+
+
 def compute_variance_proxy_metrics(batch: DataProto, gradient_norm: float = None) -> dict[str, float]:
     """
     Compute variance proxy metrics using the simplified expected squared norm approach.

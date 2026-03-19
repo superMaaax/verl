@@ -106,6 +106,7 @@ class AdvantageEstimator(str, Enum):
     """
 
     GAE = "gae"
+    ZERO_CRITIC = "zero_critic"
     GRPO = "grpo"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
@@ -271,6 +272,33 @@ def compute_gae_advantage_return(
         returns = advantages + values
         advantages = verl_F.masked_whiten(advantages, response_mask)
     return advantages, returns
+
+
+@register_adv_est(AdvantageEstimator.ZERO_CRITIC)
+def compute_zero_critic_advantage_return(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    gamma: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute discounted reward-to-go with no learned value baseline.
+
+    This is equivalent to PPO with a fixed zero value function V(s_t)=0 and
+    lambda fixed to 1.0, i.e. a REINFORCE-style reward-to-go estimator whose
+    advantages are subsequently whitened in the same way as the standard GAE path.
+    """
+    lam = kwargs.get("lam", 1.0)
+    if lam != 1.0:
+        raise ValueError("zero_critic requires lam=1.0 because it uses pure reward-to-go with no learned baseline.")
+    zero_values = torch.zeros_like(token_level_rewards)
+    return compute_gae_advantage_return(
+        token_level_rewards=token_level_rewards,
+        values=zero_values,
+        response_mask=response_mask,
+        gamma=gamma,
+        lam=1.0,
+    )
 
 
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.

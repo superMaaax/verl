@@ -27,6 +27,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    compute_zero_critic_metrics,
     process_validation_metrics,
 )
 from verl.utils.metric import (
@@ -287,6 +288,25 @@ class TestMetric(unittest.TestCase):
 
         self.assertEqual(result["custom_metric"], 2.0)
         self.assertEqual(result["list_metric"], 5.0)
+
+
+class TestZeroCriticMetrics(unittest.TestCase):
+    def test_compute_zero_critic_metrics(self):
+        metrics = compute_zero_critic_metrics()
+
+        expected = {
+            "critic/vf_loss",
+            "critic/vf_clipfrac",
+            "critic/vf_explained_var",
+            "critic/vpred_mean",
+            "critic/values/mean",
+            "critic/values/max",
+            "critic/values/min",
+            "critic/prompt_end_value/mean",
+            "critic/grad_norm",
+        }
+        self.assertEqual(set(metrics.keys()), expected)
+        self.assertTrue(all(value == 0.0 for value in metrics.values()))
 
 
 class TestComputeDataMetrics(unittest.TestCase):

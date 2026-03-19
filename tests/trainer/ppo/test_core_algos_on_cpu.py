@@ -19,16 +19,21 @@ import numpy as np
 import pytest
 import torch
 
+from verl import DataProto
+from verl.trainer.config import AlgoConfig
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
+    AdvantageEstimator,
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
+    compute_zero_critic_advantage_return,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
     get_adv_estimator_fn,
     register_adv_est,
 )
+from verl.trainer.ppo.ray_trainer import compute_advantage
 
 
 def mock_test_fn():
@@ -195,6 +200,67 @@ def test_multi_turn_compute_gae_advantage_return():
     assert torch.equal(adv1, adv2), f"{adv1=}, {adv2=}"
     assert torch.equal(ret1, ret2), f"{ret1=}, {ret2=}"
     print(f" [CORRECT] \n\n{adv1=}, \n\n{ret1=}")
+
+
+def test_zero_critic_matches_zero_value_gae():
+    rewards = torch.tensor([[0.2, 0.3, 0.0, 0.0], [1.0, -0.5, 0.4, 0.0]], dtype=torch.float32)
+    response_mask = torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.float32)
+    gamma = 0.9
+
+    advantages, returns = compute_zero_critic_advantage_return(
+        token_level_rewards=rewards,
+        response_mask=response_mask,
+        gamma=gamma,
+    )
+
+    expected_advantages, expected_returns = compute_gae_advantage_return(
+        token_level_rewards=rewards,
+        values=torch.zeros_like(rewards),
+        response_mask=response_mask,
+        gamma=gamma,
+        lam=1.0,
+    )
+
+    torch.testing.assert_close(returns, expected_returns)
+    torch.testing.assert_close(advantages, expected_advantages)
+
+
+def test_compute_advantage_zero_critic_injects_zero_values():
+    data = DataProto.from_single_dict(
+        {
+            "token_level_rewards": torch.tensor([[0.2, 0.3, 0.0], [1.0, -0.5, 0.4]], dtype=torch.float32),
+            "response_mask": torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.float32),
+        }
+    )
+
+    output = compute_advantage(
+        data,
+        adv_estimator=AdvantageEstimator.ZERO_CRITIC,
+        gamma=0.9,
+        lam=1.0,
+        config=AlgoConfig(adv_estimator="zero_critic"),
+    )
+
+    assert "values" in output.batch
+    torch.testing.assert_close(output.batch["values"], torch.zeros_like(output.batch["returns"]))
+
+
+def test_compute_advantage_zero_critic_rejects_nonunit_lambda():
+    data = DataProto.from_single_dict(
+        {
+            "token_level_rewards": torch.tensor([[0.2, 0.3, 0.0]], dtype=torch.float32),
+            "response_mask": torch.tensor([[1, 1, 0]], dtype=torch.float32),
+        }
+    )
+
+    with pytest.raises(ValueError, match="lam must be 1.0"):
+        compute_advantage(
+            data,
+            adv_estimator=AdvantageEstimator.ZERO_CRITIC,
+            gamma=0.9,
+            lam=0.95,
+            config=AlgoConfig(adv_estimator="zero_critic"),
+        )
 
 
 def _make_group_index(batch_size: int, num_groups: int) -> np.ndarray:

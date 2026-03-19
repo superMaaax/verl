@@ -3,7 +3,7 @@ export VLLM_USE_V1=0
 export HYDRA_FULL_ERROR=0
 export VLLM_USE_V1=1
 export WANDB_PROJECT="PPO_midi"
-export SLURM_JOB_ID="05b_vh_init_e5_gated_carry"
+export SLURM_JOB_ID="05b_vh_init_e3_gated_carry_v_warmup_e2"
 
 # When true, math_dapo incorrect answers get reward 0.0 instead of -1.0.
 MATH_DAPO_BINARY_REWARD=true
@@ -44,10 +44,11 @@ python3 -m verl.trainer.main_ppo \
   critic.model.path=/data/shuozhe/saved_model/Qwen2.5-0.5B \
   critic.model.external_lib=trl \
   critic.model.value_head_init_mean=0.0 \
-  critic.model.value_head_init_std=0.00001 \
+  critic.model.value_head_init_std=0.001 \
   critic.model.fsdp_config.param_offload=False \
   critic.ppo_micro_batch_size_per_gpu=4 \
   trainer.use_legacy_worker_impl=enable \
+  trainer.critic_warmup=101 \
   trainer.val_before_train=True \
   trainer.n_gpus_per_node=4 \
   trainer.nnodes=1 \

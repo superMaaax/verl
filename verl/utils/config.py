@@ -83,8 +83,16 @@ def validate_config(
         use_reference_policy (bool): is ref policy needed
         use_critic (bool): is critic needed
     """
+    from verl.trainer.ppo.core_algos import AdvantageEstimator
+
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+
+    if config.algorithm.adv_estimator == AdvantageEstimator.ZERO_CRITIC and config.algorithm.lam != 1.0:
+        raise ValueError(
+            "algorithm.lam is ignored for algorithm.adv_estimator=zero_critic. "
+            "Set algorithm.lam=1.0 to keep the configuration unambiguous."
+        )
 
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if config.actor_rollout_ref.actor.strategy == "megatron":

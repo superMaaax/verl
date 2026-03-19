@@ -56,6 +56,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    compute_zero_critic_metrics,
     process_validation_metrics,
 )
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
@@ -192,6 +193,22 @@ def compute_advantage(
                 config.pf_ppo.get("reweight_method"),
                 config.pf_ppo.get("weight_pow"),
             )
+    elif adv_estimator == AdvantageEstimator.ZERO_CRITIC:
+        if lam != 1.0:
+            raise ValueError("algorithm.lam must be 1.0 when algorithm.adv_estimator=zero_critic.")
+        advantages, returns = core_algos.compute_zero_critic_advantage_return(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            gamma=gamma,
+            config=config,
+        )
+        # TODO (TQ): adapt core_algos.compute_pf_ppo_reweight_data function to support transfer queue
+        if config.get("use_pf_ppo", False):
+            data = core_algos.compute_pf_ppo_reweight_data(
+                data,
+                config.pf_ppo.get("reweight_method"),
+                config.pf_ppo.get("weight_pow"),
+            )
     elif adv_estimator == AdvantageEstimator.GRPO:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
@@ -300,6 +317,7 @@ class RayPPOTrainer:
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_rm = need_reward_model(self.config)
         self.use_critic = need_critic(self.config)
+        self.use_zero_critic = self.config.algorithm.adv_estimator == AdvantageEstimator.ZERO_CRITIC
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
@@ -1411,9 +1429,10 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
 
-                        advantages_td = TensorDict(
-                            {"advantages": advantages, "returns": returns}, batch_size=advantages.size(0)
-                        )
+                        tensors = {"advantages": advantages, "returns": returns}
+                        if self.use_zero_critic:
+                            tensors["values"] = torch.zeros_like(returns)
+                        advantages_td = TensorDict(tensors, batch_size=advantages.size(0))
                         compute_advantage_meta = self.tq_client.put(data=advantages_td, metadata=compute_advantage_meta)
                         batch_meta = batch_meta.union(compute_advantage_meta)
 
@@ -1426,7 +1445,7 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
+                    if self.use_zero_critic or self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch_meta.extra_info["multi_turn"] = (
@@ -1554,6 +1573,8 @@ class RayPPOTrainer:
                 metrics.update(
                     compute_data_metrics_decorated(batch=compute_data_metrics_meta, use_critic=self.use_critic)
                 )
+                if self.use_zero_critic:
+                    metrics.update(compute_zero_critic_metrics())
 
                 compute_timing_metrics_fields = ["responses", "attention_mask"]
                 compute_timing_metrics_meta = batch_meta.select_fields(compute_timing_metrics_fields)

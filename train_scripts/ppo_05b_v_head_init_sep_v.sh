@@ -3,10 +3,18 @@ export VLLM_USE_V1=0
 export HYDRA_FULL_ERROR=0
 export VLLM_USE_V1=1
 export WANDB_PROJECT="PPO_midi"
-export SLURM_JOB_ID="05b_vh_init_e5_metamath_v_warmup_e2"
+export SLURM_JOB_ID="05b_vh_init_e5_metamath_sep_v_warmup_e2"
 
 # When true, math_dapo incorrect answers get reward 0.0 instead of -1.0.
 MATH_DAPO_BINARY_REWARD=true
+
+ACTOR_MODEL=/data/shuozhe/saved_model/Qwen2.5-0.5B
+# Point this to a different checkpoint to use a separate critic backbone.
+CRITIC_MODEL=/data/shuozhe/saved_model/Qwen2.5-0.5B
+# Keep tokenizer/vocab aligned with the actor unless the critic checkpoint uses the exact same tokenizer.
+CRITIC_TOKENIZER=${ACTOR_MODEL}
+# Leave the init settings below enabled when CRITIC_MODEL is a plain LM checkpoint.
+# If CRITIC_MODEL already has trained value-head weights, remove those two overrides.
 
   # data.train_files=/data/shuozhe/saved_dataset/verl_math_7500_500_5000/train.parquet \
   # data.val_files=/data/shuozhe/saved_dataset/verl_math_7500_500_5000/test.parquet \
@@ -19,7 +27,7 @@ python3 -m verl.trainer.main_ppo \
   data.train_batch_size=32 \
   data.max_prompt_length=2048 \
   data.max_response_length=2048 \
-  actor_rollout_ref.model.path=/data/shuozhe/saved_model/Qwen2.5-0.5B \
+  actor_rollout_ref.model.path="${ACTOR_MODEL}" \
   actor_rollout_ref.actor.optim.lr=1e-6 \
   actor_rollout_ref.actor.ppo_mini_batch_size=32 \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
@@ -39,7 +47,8 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.hybrid_engine=True \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
   critic.optim.lr=1e-5 \
-  critic.model.path=/data/shuozhe/saved_model/Qwen2.5-0.5B \
+  critic.model.path="${CRITIC_MODEL}" \
+  critic.model.tokenizer_path="${CRITIC_TOKENIZER}" \
   critic.model.external_lib=trl \
   critic.model.value_head_init_mean=0.0 \
   critic.model.value_head_init_std=0.00001 \

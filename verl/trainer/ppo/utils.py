@@ -85,6 +85,13 @@ def need_reward_model(
 
 def need_critic(config: DictConfig) -> bool:
     """Given a config, do we need critic."""
+    if config.algorithm.adv_estimator == AdvantageEstimator.ZERO_CRITIC:
+        if config.critic.enable not in (None, False):
+            warnings.warn(
+                "Ignoring critic.enable because algorithm.adv_estimator=zero_critic disables the learned critic.",
+                stacklevel=2,
+            )
+        return False
     if config.critic.enable is not None:
         return bool(config.critic.enable)
     elif config.algorithm.adv_estimator == AdvantageEstimator.GAE:

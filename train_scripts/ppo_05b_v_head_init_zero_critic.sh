@@ -3,7 +3,7 @@ export VLLM_USE_V1=0
 export HYDRA_FULL_ERROR=0
 export VLLM_USE_V1=1
 export WANDB_PROJECT="PPO_midi"
-export SLURM_JOB_ID="05b_vh_init_e5_metamath_v_warmup_e2"
+export SLURM_JOB_ID="05b_zero_critic"
 
 # When true, math_dapo incorrect answers get reward 0.0 instead of -1.0.
 MATH_DAPO_BINARY_REWARD=true
@@ -46,7 +46,8 @@ python3 -m verl.trainer.main_ppo \
   critic.model.fsdp_config.param_offload=False \
   critic.ppo_micro_batch_size_per_gpu=4 \
   +reward.reward_kwargs.math_dapo_binary_reward=${MATH_DAPO_BINARY_REWARD} \
-  trainer.critic_warmup=101 \
+  algorithm.adv_estimator=zero_critic \
+  algorithm.lam=1.0 \
   trainer.val_before_train=True \
   trainer.n_gpus_per_node=4 \
   trainer.nnodes=1 \

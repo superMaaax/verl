@@ -47,6 +47,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
+    compute_zero_critic_metrics,
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
@@ -174,6 +175,24 @@ def compute_advantage(
                 config.pf_ppo.get("reweight_method"),
                 config.pf_ppo.get("weight_pow"),
             )
+    elif adv_estimator == AdvantageEstimator.ZERO_CRITIC:
+        if lam != 1.0:
+            raise ValueError("algorithm.lam must be 1.0 when algorithm.adv_estimator=zero_critic.")
+        advantages, returns = core_algos.compute_zero_critic_advantage_return(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            gamma=gamma,
+            config=config,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+        data.batch["values"] = torch.zeros_like(returns)
+        if config.get("use_pf_ppo", False):
+            data = core_algos.compute_pf_ppo_reweight_data(
+                data,
+                config.pf_ppo.get("reweight_method"),
+                config.pf_ppo.get("weight_pow"),
+            )
     elif adv_estimator == AdvantageEstimator.GRPO:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
@@ -280,6 +299,7 @@ class RayPPOTrainer:
         self.use_rm = need_reward_model(self.config)
 
         self.use_critic = need_critic(self.config)
+        self.use_zero_critic = self.config.algorithm.adv_estimator == AdvantageEstimator.ZERO_CRITIC
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
@@ -302,6 +322,17 @@ class RayPPOTrainer:
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _should_update_actor(self) -> bool:
+        return self.use_zero_critic or self.config.trainer.critic_warmup <= self.global_steps
+
+    def _should_refresh_rollout_after_critic_only_step(self) -> bool:
+        rollout_config = self.config.actor_rollout_ref.rollout
+        return rollout_config.checkpoint_engine.backend == "naive" and rollout_config.free_cache_engine
+
+    def _maybe_add_zero_critic_metrics(self, metrics: dict[str, Any]) -> None:
+        if self.use_zero_critic:
+            metrics.update(compute_zero_critic_metrics())
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -1503,7 +1534,8 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
+                    should_update_actor = self._should_update_actor()
+                    if should_update_actor:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
@@ -1530,10 +1562,15 @@ class RayPPOTrainer:
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
                                 self._save_checkpoint()
 
-                        # update weights from trainer to rollout
+                    if should_update_actor or self._should_refresh_rollout_after_critic_only_step():
+                        # In hybrid mode with the naive checkpoint engine, rollout replicas are
+                        # put to sleep after generation. During critic warmup we skip actor
+                        # updates, but we still need to refresh the sleeping rollout so the next
+                        # generation step does not run against freed GPU state.
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights()
 
+                    if should_update_actor:
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
@@ -1578,6 +1615,7 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                self._maybe_add_zero_critic_metrics(metrics)
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
@@ -1617,4 +1655,3 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
-
