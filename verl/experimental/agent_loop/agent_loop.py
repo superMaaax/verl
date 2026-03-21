@@ -785,6 +785,7 @@ class AgentLoopWorker:
             "is_cancel",
             "param_version_start",
             "param_version_end",
+            "termination_reason",
             "extras",
         }
         all_keys = set(key for input_item in inputs for key in input_item.extra_fields) | default_extra_keys

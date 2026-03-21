@@ -91,7 +91,7 @@ class AgentData:
         self.routed_experts = None
 
         # Extra fields for dynamic addition, e.g., tool session data
-        self.extra_fields: dict[str, Any] = {}
+        self.extra_fields: dict[str, Any] = {"termination_reason": None}
 
 
 @register("tool_agent")
@@ -206,7 +206,7 @@ class ToolAgentLoop(AgentLoopBase):
             num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,
             metrics=agent_data.metrics,
             routed_experts=agent_data.routed_experts,
-            extra_fields={},
+            extra_fields={"termination_reason": agent_data.extra_fields.get("termination_reason")},
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
         return output
@@ -243,6 +243,7 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             agent_data.metrics["num_preempted"] += output.num_preempted if output.num_preempted is not None else 0
 
+        agent_data.extra_fields["termination_reason"] = output.stop_reason
         agent_data.assistant_turns += 1
         agent_data.response_ids = output.token_ids
         agent_data.prompt_ids += agent_data.response_ids
@@ -255,10 +256,13 @@ class ToolAgentLoop(AgentLoopBase):
 
         # Check termination conditions
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
+            agent_data.extra_fields["termination_reason"] = "max_length"
             return AgentState.TERMINATED
         if self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
+            agent_data.extra_fields["termination_reason"] = "turn_limit"
             return AgentState.TERMINATED
         if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
+            agent_data.extra_fields["termination_reason"] = "turn_limit"
             return AgentState.TERMINATED
 
         # Extract tool calls
@@ -361,6 +365,7 @@ class ToolAgentLoop(AgentLoopBase):
             )
 
         if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
+            agent_data.extra_fields["termination_reason"] = "max_length"
             return AgentState.TERMINATED
         # Update prompt_ids and response_mask
 
@@ -412,6 +417,7 @@ class ToolAgentLoop(AgentLoopBase):
         # double check prompt
         # Check termination condition
         if should_terminate_sequence:
+            agent_data.extra_fields["termination_reason"] = "interaction_end"
             return AgentState.TERMINATED
         else:
             return AgentState.GENERATING

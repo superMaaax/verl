@@ -501,9 +501,7 @@ def compute_grpo_passk_outcome_advantage(
         for idx in id2scores:
             rewards = torch.stack(id2scores[idx])  # (k,)
             if rewards.numel() < 2:
-                raise ValueError(
-                    f"Pass@k requires at least 2 samples per group. Got {rewards.numel()} for group {idx}."
-                )
+                continue
             topk, topk_idx = torch.topk(rewards, 2)
             r_max, r_second_max = topk[0], topk[1]
             i_max = id2indices[idx][topk_idx[0].item()]
@@ -1150,12 +1148,15 @@ def agg_loss(
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
+    loss_mask = loss_mask.to(dtype=loss_mat.dtype)
+
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
             if dp_size > 1:
                 raise ValueError("(global) batch_num_tokens is required when dp_size > 1")
             batch_num_tokens = loss_mask.sum()
-        loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
+        denom = torch.clamp(torch.as_tensor(batch_num_tokens, device=loss_mat.device, dtype=loss_mat.dtype), min=1.0)
+        loss = verl_F.masked_sum(loss_mat, loss_mask) / denom * dp_size
     elif loss_agg_mode == "seq-mean-token-sum":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
         seq_mask = (torch.sum(loss_mask, dim=-1) > 0).float()  # exclude fully masked sequences
@@ -1163,7 +1164,11 @@ def agg_loss(
             if dp_size > 1:
                 raise ValueError("global_batch_size is required when dp_size > 1")
             global_batch_size = seq_mask.sum()
-        loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
+        denom = torch.clamp(
+            torch.as_tensor(global_batch_size, device=loss_mat.device, dtype=loss_mat.dtype),
+            min=1.0,
+        )
+        loss = verl_F.masked_sum(seq_losses, seq_mask) / denom * dp_size  # seq-mean
     elif loss_agg_mode == "seq-mean-token-mean":
         seq_mask = torch.sum(loss_mask, dim=-1)  # per-sequence token count
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (seq_mask + 1e-8)  # token-mean
@@ -1172,7 +1177,11 @@ def agg_loss(
             if dp_size > 1:
                 raise ValueError("global_batch_size is required when dp_size > 1")
             global_batch_size = seq_mask.sum()
-        loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
+        denom = torch.clamp(
+            torch.as_tensor(global_batch_size, device=loss_mat.device, dtype=loss_mat.dtype),
+            min=1.0,
+        )
+        loss = verl_F.masked_sum(seq_losses, seq_mask) / denom * dp_size  # seq-mean
     elif loss_agg_mode == "seq-mean-token-sum-norm":
         if loss_scale_factor is None:
             raise ValueError(
@@ -1180,7 +1189,11 @@ def agg_loss(
                 'If not intented for custom scaling factor, try setting loss_agg_mode="seq-mean-token-sum".'
             )
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
-        loss = torch.sum(seq_losses) / loss_scale_factor * dp_size
+        denom = torch.clamp(
+            torch.as_tensor(loss_scale_factor, device=loss_mat.device, dtype=loss_mat.dtype),
+            min=1.0,
+        )
+        loss = torch.sum(seq_losses) / denom * dp_size
     else:
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
 
@@ -2307,8 +2320,18 @@ def compute_pf_ppo_reweight_data(
         return weights
 
     scores = data.batch["token_level_scores"].sum(dim=-1)
+    sample_weight = data.batch.get("sample_weight", None)
+    if sample_weight is not None:
+        weights_mask = sample_weight.to(dtype=scores.dtype)
+    else:
+        weights_mask = torch.ones_like(scores)
+    if weights_mask.sum() <= 0:
+        return data
     weights = compute_weights(scores, reweight_method, weight_pow)
-    weights = torch.clamp(weights + 1e-8, min=1e-8)
+    weights = weights * weights_mask
+    if weights.sum() <= 0:
+        weights = weights_mask
+    weights = torch.clamp(weights + 1e-8 * weights_mask, min=1e-8)
 
     batch_size = scores.shape[0]
     sample_indices = torch.multinomial(weights, batch_size, replacement=True)

@@ -582,8 +582,10 @@ class vLLMHttpServer:
         finish_reason = final_res.outputs[0].finish_reason
         if finish_reason == "abort":
             stop_reason = "aborted"
-        elif finish_reason in ("stop", "length"):
-            stop_reason = "completed"
+        elif finish_reason == "stop":
+            stop_reason = "eos"
+        elif finish_reason == "length":
+            stop_reason = "max_length"
         else:
             stop_reason = finish_reason  # for more stop reason in the future
 

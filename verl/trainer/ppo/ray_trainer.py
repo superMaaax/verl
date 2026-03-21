@@ -45,6 +45,7 @@ from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_grpo_baseline_metrics,
+    compute_overlong_filtering_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
@@ -86,7 +87,8 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     """
     response_mask = data.batch["response_mask"]
     token_level_scores = data.batch["token_level_scores"]
-    batch_size = data.batch.batch_size[0]
+    valid_seq_mask = response_mask.sum(dim=-1) > 0
+    valid_batch_size = int(valid_seq_mask.sum().item())
 
     # compute kl between ref_policy and current policy
     # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
@@ -99,10 +101,14 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     token_level_rewards = token_level_scores - beta * kld
 
     current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
-    current_kl = torch.mean(current_kl, dim=0).item()
+    if valid_batch_size > 0:
+        current_kl = torch.mean(current_kl[valid_seq_mask], dim=0).item()
+    else:
+        current_kl = 0.0
 
     # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
-    kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
+    if valid_batch_size > 0:
+        kl_ctrl.update(current_kl=current_kl, n_steps=valid_batch_size)
     data.batch["token_level_rewards"] = token_level_rewards
 
     metrics = {"actor/reward_kl_penalty": current_kl, "actor/reward_kl_penalty_coeff": beta}
@@ -126,6 +132,99 @@ def compute_response_mask(data: DataProto):
     response_length = responses.size(1)
     attention_mask = data.batch["attention_mask"]
     return attention_mask[:, -response_length:]
+
+
+_OVERLONG_TERMINATION_REASONS = {"max_length", "length", "max_tokens", "max_new_tokens", "truncated"}
+_NON_OVERLONG_TERMINATION_REASONS = {"eos", "stop", "aborted", "turn_limit", "tool_call", "interaction_end"}
+
+
+def _normalize_eos_token_ids(eos_token_id: Any) -> set[int]:
+    if eos_token_id is None:
+        return set()
+    if isinstance(eos_token_id, (list, tuple, set)):
+        return {int(token_id) for token_id in eos_token_id}
+    return {int(eos_token_id)}
+
+
+def infer_overlong_mask(
+    data: DataProto,
+    eos_token_id: Any = None,
+) -> tuple[torch.Tensor, np.ndarray]:
+    """Infer whether each sample ended because it exhausted the response-length budget."""
+    raw_response_mask = data.batch.get("response_mask")
+    if raw_response_mask is None:
+        raw_response_mask = compute_response_mask(data)
+
+    responses = data.batch["responses"]
+    batch_size, max_response_length = responses.shape
+    response_lengths = raw_response_mask.sum(dim=-1).to(dtype=torch.long)
+    eos_token_ids = _normalize_eos_token_ids(eos_token_id)
+
+    termination_reasons = data.non_tensor_batch.get("termination_reason")
+    if termination_reasons is None:
+        inferred_reasons = np.empty(batch_size, dtype=object)
+        inferred_reasons[:] = None
+    else:
+        inferred_reasons = np.asarray(termination_reasons, dtype=object).copy()
+
+    is_overlong = torch.zeros(batch_size, dtype=torch.bool, device=responses.device)
+
+    for idx in range(batch_size):
+        reason = inferred_reasons[idx]
+        if isinstance(reason, bytes):
+            reason = reason.decode("utf-8")
+        if isinstance(reason, str):
+            reason = reason.strip().lower()
+        else:
+            reason = None
+
+        if reason in _OVERLONG_TERMINATION_REASONS:
+            is_overlong[idx] = True
+            inferred_reasons[idx] = "max_length"
+            continue
+        if reason in _NON_OVERLONG_TERMINATION_REASONS:
+            inferred_reasons[idx] = reason
+            continue
+
+        response_length = int(response_lengths[idx].item())
+        if response_length <= 0:
+            inferred_reasons[idx] = "aborted"
+            continue
+
+        hit_response_limit = response_length >= max_response_length
+        last_token_id = int(responses[idx, response_length - 1].item())
+        ended_with_eos = last_token_id in eos_token_ids if eos_token_ids else False
+
+        overlong = hit_response_limit and not ended_with_eos
+        is_overlong[idx] = overlong
+        if overlong:
+            inferred_reasons[idx] = "max_length"
+        elif ended_with_eos:
+            inferred_reasons[idx] = "eos"
+        else:
+            inferred_reasons[idx] = "unknown"
+
+    return is_overlong, inferred_reasons
+
+
+def apply_overlong_filtering(data: DataProto, eos_token_id: Any = None) -> DataProto:
+    raw_response_mask = data.batch.get("response_mask")
+    if raw_response_mask is None:
+        raw_response_mask = compute_response_mask(data)
+    raw_response_mask = raw_response_mask.clone()
+
+    is_overlong, termination_reasons = infer_overlong_mask(data=data, eos_token_id=eos_token_id)
+    sample_weight = (~is_overlong).to(dtype=raw_response_mask.dtype)
+    filtered_response_mask = raw_response_mask * sample_weight.unsqueeze(-1)
+
+    data.batch["raw_response_mask"] = raw_response_mask
+    data.batch["is_overlong"] = is_overlong
+    data.batch["sample_weight"] = sample_weight
+    data.batch["overlong_filtered_response_mask"] = filtered_response_mask.clone()
+    data.batch["response_mask"] = filtered_response_mask
+    data.non_tensor_batch["termination_reason"] = termination_reasons
+    data.non_tensor_batch["is_overlong"] = is_overlong.cpu().numpy()
+    return data
 
 
 def compute_advantage(
@@ -158,6 +257,31 @@ def compute_advantage(
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
+    valid_sample_mask = data.batch["response_mask"].sum(dim=-1) > 0
+
+    def scatter_valid_results(
+        valid_advantages: torch.Tensor,
+        valid_returns: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        full_advantages = torch.zeros_like(data.batch["token_level_rewards"])
+        full_returns = torch.zeros_like(data.batch["token_level_rewards"])
+        full_advantages[valid_sample_mask] = valid_advantages
+        full_returns[valid_sample_mask] = valid_returns
+        return full_advantages, full_returns
+
+    grouped_adv_estimators = {
+        AdvantageEstimator.GRPO,
+        AdvantageEstimator.GRPO_VECTORIZED,
+        AdvantageEstimator.GRPO_PASSK,
+        AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
+        AdvantageEstimator.RLOO,
+        AdvantageEstimator.OPO,
+        AdvantageEstimator.GPG,
+        AdvantageEstimator.RLOO_VECTORIZED,
+        AdvantageEstimator.OPTIMAL_TOKEN_BASELINE,
+        AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE,
+    }
+
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
@@ -170,7 +294,7 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
-        if config.get("use_pf_ppo", False):
+        if config.get("use_pf_ppo", False) and valid_sample_mask.any():
             data = core_algos.compute_pf_ppo_reweight_data(
                 data,
                 config.pf_ppo.get("reweight_method"),
@@ -195,7 +319,7 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
-        if config.get("use_pf_ppo", False):
+        if config.get("use_pf_ppo", False) and valid_sample_mask.any():
             data = core_algos.compute_pf_ppo_reweight_data(
                 data,
                 config.pf_ppo.get("reweight_method"),
@@ -213,7 +337,7 @@ def compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
         data.batch["values"] = torch.zeros_like(returns)
-        if config.get("use_pf_ppo", False):
+        if config.get("use_pf_ppo", False) and valid_sample_mask.any():
             data = core_algos.compute_pf_ppo_reweight_data(
                 data,
                 config.pf_ppo.get("reweight_method"),
@@ -223,13 +347,17 @@ def compute_advantage(
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
 
-        # Call compute_grpo_outcome_advantage with parameters matching its definition
-        advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=grpo_calculation_mask,
-            index=data.non_tensor_batch["uid"],
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-        )
+        if valid_sample_mask.any():
+            valid_advantages, valid_returns = core_algos.compute_grpo_outcome_advantage(
+                token_level_rewards=data.batch["token_level_rewards"][valid_sample_mask],
+                response_mask=grpo_calculation_mask[valid_sample_mask],
+                index=data.non_tensor_batch["uid"][valid_sample_mask.cpu().numpy()],
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            )
+            advantages, returns = scatter_valid_results(valid_advantages, valid_returns)
+        else:
+            advantages = torch.zeros_like(data.batch["token_level_rewards"])
+            returns = torch.zeros_like(data.batch["token_level_rewards"])
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     else:
@@ -256,8 +384,30 @@ def compute_advantage(
             rollout_is_weights = data.batch.get("rollout_is_weights", None)
             adv_kwargs["rollout_is_weights"] = rollout_is_weights
 
-        # calculate advantage estimator
-        advantages, returns = adv_estimator_fn(**adv_kwargs)
+        if adv_estimator in grouped_adv_estimators and not torch.all(valid_sample_mask):
+            if valid_sample_mask.any():
+                valid_adv_kwargs = {
+                    "token_level_rewards": adv_kwargs["token_level_rewards"][valid_sample_mask],
+                    "response_mask": adv_kwargs["response_mask"][valid_sample_mask],
+                    "config": adv_kwargs["config"],
+                }
+                if "index" in adv_kwargs:
+                    valid_adv_kwargs["index"] = adv_kwargs["index"][valid_sample_mask.cpu().numpy()]
+                if "reward_baselines" in adv_kwargs:
+                    valid_adv_kwargs["reward_baselines"] = adv_kwargs["reward_baselines"][valid_sample_mask]
+                if "sum_pi_squared" in adv_kwargs:
+                    valid_adv_kwargs["sum_pi_squared"] = adv_kwargs["sum_pi_squared"][valid_sample_mask]
+                if "rollout_is_weights" in adv_kwargs and adv_kwargs["rollout_is_weights"] is not None:
+                    valid_adv_kwargs["rollout_is_weights"] = adv_kwargs["rollout_is_weights"][valid_sample_mask]
+
+                valid_advantages, valid_returns = adv_estimator_fn(**valid_adv_kwargs)
+                advantages, returns = scatter_valid_results(valid_advantages, valid_returns)
+            else:
+                advantages = torch.zeros_like(data.batch["token_level_rewards"])
+                returns = torch.zeros_like(data.batch["token_level_rewards"])
+        else:
+            # calculate advantage estimator
+            advantages, returns = adv_estimator_fn(**adv_kwargs)
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     return data
@@ -1467,6 +1617,9 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    if self.config.trainer.get("overlong_filtering", False):
+                        eos_token_id = batch.meta_info.get("eos_token_id", self.tokenizer.eos_token_id)
+                        batch = apply_overlong_filtering(batch, eos_token_id=eos_token_id)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1553,10 +1706,12 @@ class RayPPOTrainer:
                             values = self._compute_values(batch)
                             batch = batch.union(values)
 
+                    all_training_tokens_masked = False
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         batch.batch["token_level_scores"] = reward_tensor
+                        has_training_tokens = batch.batch["response_mask"].sum().item() > 0
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
@@ -1577,6 +1732,7 @@ class RayPPOTrainer:
                             rollout_corr_config is not None
                             and "rollout_log_probs" in batch.batch
                             and not bypass_recomputing_logprobs  # Only in decoupled mode
+                            and has_training_tokens
                         ):
                             from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
 
@@ -1599,22 +1755,53 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        all_training_tokens_masked = batch.batch["response_mask"].sum().item() == 0
+                        if self.config.trainer.get("overlong_filtering", False):
+                            metrics["overlong_filtering/all_training_tokens_masked"] = int(all_training_tokens_masked)
 
                     # update critic
+                    refresh_rollout_after_skip = False
                     if self.use_critic:
-                        with marked_timer("update_critic", timing_raw, color="pink"):
-                            critic_output = self._update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
+                        if all_training_tokens_masked:
+                            refresh_rollout_after_skip = True
+                            metrics.update(
+                                {
+                                    "critic/vf_loss": 0.0,
+                                    "critic/vf_clipfrac": 0.0,
+                                    "critic/vpred_mean": 0.0,
+                                    "critic/grad_norm": 0.0,
+                                    "training/critic_update_skipped_no_valid_samples": 1,
+                                }
+                            )
+                        else:
+                            with marked_timer("update_critic", timing_raw, color="pink"):
+                                critic_output = self._update_critic(batch)
+                            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                            metrics.update(critic_output_metrics)
+                            metrics["training/critic_update_skipped_no_valid_samples"] = 0
 
                     # implement the actor update schedule
-                    should_update_actor = self._should_update_actor()
+                    scheduled_actor_update = self._should_update_actor()
                     metrics["training/actor_update_interval"] = self._get_effective_actor_update_interval()
-                    metrics["training/is_actor_update_step"] = int(should_update_actor)
+                    metrics["training/is_actor_update_step"] = int(scheduled_actor_update)
+                    should_update_actor = scheduled_actor_update and not all_training_tokens_masked
+                    metrics["training/actor_update_skipped_no_valid_samples"] = int(
+                        scheduled_actor_update and all_training_tokens_masked
+                    )
                     if should_update_actor:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
+                    elif scheduled_actor_update and all_training_tokens_masked:
+                        refresh_rollout_after_skip = True
+                        metrics.update(
+                            {
+                                "actor/pg_loss": 0.0,
+                                "actor/grad_norm": 0.0,
+                            }
+                        )
+                        if self.config.actor_rollout_ref.actor.use_kl_loss:
+                            metrics["actor/kl_loss"] = 0.0
 
                     # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                     esi_close_to_expiration = should_save_ckpt_esi(
@@ -1638,7 +1825,7 @@ class RayPPOTrainer:
                         with marked_timer("save_checkpoint", timing_raw, color="green"):
                             self._save_checkpoint()
 
-                    if should_update_actor or self._should_refresh_rollout_after_critic_only_step():
+                    if should_update_actor or refresh_rollout_after_skip or self._should_refresh_rollout_after_critic_only_step():
                         # In hybrid mode with the naive checkpoint engine, rollout replicas are
                         # put to sleep after generation. On any critic-only step (critic warmup
                         # or a sparse actor update schedule), refresh the sleeping rollout so the
@@ -1691,6 +1878,8 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                if self.config.trainer.get("overlong_filtering", False):
+                    metrics.update(compute_overlong_filtering_metrics(batch=batch))
                 if self.config.algorithm.adv_estimator in {
                     AdvantageEstimator.GRPO,
                     AdvantageEstimator.GRPO_VECTORIZED,
@@ -1704,6 +1893,11 @@ class RayPPOTrainer:
                 # compute variance proxy metrics
                 gradient_norm = metrics.get("actor/grad_norm", None)
                 metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
+                if self.config.trainer.get("overlong_filtering", False):
+                    if "actor/pg_loss" in metrics:
+                        metrics["overlong_filtering/actor_pg_loss_valid_only"] = metrics["actor/pg_loss"]
+                    if "critic/vf_loss" in metrics:
+                        metrics["overlong_filtering/critic_vf_loss_valid_only"] = metrics["critic/vf_loss"]
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one

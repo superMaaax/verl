@@ -137,7 +137,7 @@ class MegatronPPOCritic(BasePPOCritic):
             ]  # Values are predicted at the ends of prefixes, e.g., the last prompt token
             if self.value_spec.is_categorical():
                 values, _, _ = value_logits_to_scalar_expectation(values, self.value_spec)
-            response_mask = attention_mask[:, -response_length:]
+            response_mask = data.batch["response_mask"] if "response_mask" in data.batch else attention_mask[:, -response_length:]
             values = values * response_mask  # Only action tokens have values
             values = values.contiguous()
 
@@ -158,7 +158,7 @@ class MegatronPPOCritic(BasePPOCritic):
         return values
 
     def make_minibatch_iterator(self, data: DataProto) -> Iterable[DataProto]:
-        select_keys = ["input_ids", "responses", "attention_mask", "position_ids", "values", "returns"]
+        select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns"]
         data = data.select(batch_keys=select_keys)
         return data.make_iterator(
             mini_batch_size=self.config.ppo_mini_batch_size,
@@ -230,7 +230,7 @@ class MegatronPPOCritic(BasePPOCritic):
             returns = data["returns"]
             response_length = responses.size(1)
 
-            response_mask = attention_mask[:, -response_length:]
+            response_mask = data["response_mask"] if "response_mask" in data.keys() else attention_mask[:, -response_length:]
 
             cliprange_value = self.config.cliprange_value
 

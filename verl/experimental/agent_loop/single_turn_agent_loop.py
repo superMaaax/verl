@@ -80,6 +80,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
             multi_modal_data=multi_modal_data,
             num_turns=2,
             metrics=metrics,
+            extra_fields={"termination_reason": output.stop_reason},
         )
 
         # keeping the schema consistent with tool_agent_loop

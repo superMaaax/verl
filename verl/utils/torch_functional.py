@@ -332,6 +332,11 @@ def masked_whiten(values, mask, shift_mean=True):
     Returns:
         torch.Tensor: Whitened tensor of same shape as `values`.
     """
+    mask_sum = mask.sum()
+    if mask_sum <= 1:
+        # Whitening is undefined for 0/1 valid elements. Return zeros so callers
+        # can safely skip this degenerate batch without NaNs or divide-by-zero.
+        return torch.zeros_like(values)
     mean, var = masked_mean(values, mask), masked_var(values, mask)
     whitened = (values - mean) * torch.rsqrt(var + 1e-8)
     if not shift_mean:

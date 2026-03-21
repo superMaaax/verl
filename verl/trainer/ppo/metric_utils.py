@@ -78,6 +78,22 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
+def _safe_mean_max_min(values: torch.Tensor) -> tuple[float, float, float]:
+    if values.numel() == 0:
+        return 0.0, 0.0, 0.0
+    return (
+        torch.mean(values).detach().item(),
+        torch.max(values).detach().item(),
+        torch.min(values).detach().item(),
+    )
+
+
+def _mean_or_zero(values: torch.Tensor) -> float:
+    if values.numel() == 0:
+        return 0.0
+    return torch.mean(values).detach().item()
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -114,43 +130,47 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
 
     prompt_mask = batch.batch["attention_mask"][:, :-max_response_length].bool()
     response_mask = batch.batch["response_mask"].bool()
+    raw_response_mask = batch.batch.get("raw_response_mask", batch.batch["response_mask"]).bool()
 
     max_prompt_length = prompt_mask.size(-1)
 
-    response_info = _compute_response_info(batch)
-    prompt_length = response_info["prompt_length"]
-    response_length = response_info["response_length"]
+    prompt_length = prompt_mask.sum(-1).float()
+    response_length = raw_response_mask.sum(-1).float()
 
     aborted_mask = (response_length == 0).bool()
     non_aborted_mask = ~aborted_mask
+    valid_training_seq_mask = response_mask.any(dim=-1)
 
-    non_aborted_sequence_score = sequence_score[non_aborted_mask]
-    non_aborted_sequence_reward = sequence_reward[non_aborted_mask]
+    valid_sequence_score = sequence_score[valid_training_seq_mask]
+    valid_sequence_reward = sequence_reward[valid_training_seq_mask]
 
-    score_mean = torch.mean(non_aborted_sequence_score).detach().item()
-    score_max = torch.max(non_aborted_sequence_score).detach().item()
-    score_min = torch.min(non_aborted_sequence_score).detach().item()
+    score_mean, score_max, score_min = _safe_mean_max_min(valid_sequence_score)
 
-    reward_mean = torch.mean(non_aborted_sequence_reward).detach().item()
-    reward_max = torch.max(non_aborted_sequence_reward).detach().item()
-    reward_min = torch.min(non_aborted_sequence_reward).detach().item()
+    reward_mean, reward_max, reward_min = _safe_mean_max_min(valid_sequence_reward)
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
+    advantages_mean, advantages_max, advantages_min = _safe_mean_max_min(valid_adv)
+    returns_mean, returns_max, returns_min = _safe_mean_max_min(valid_returns)
 
     if use_critic:
         values = batch.batch["values"]
         valid_values = torch.masked_select(values, response_mask)
-        return_diff_var = torch.var(valid_returns - valid_values)
-        return_var = torch.var(valid_returns)
-        vf_rho = (return_diff_var / (return_var + 1e-5)).detach().item()
+        values_mean, values_max, values_min = _safe_mean_max_min(valid_values)
+        if valid_returns.numel() > 1 and valid_values.numel() > 1:
+            return_diff_var = torch.var(valid_returns - valid_values)
+            return_var = torch.var(valid_returns)
+            vf_rho = (return_diff_var / (return_var + 1e-5)).detach().item()
+            vf_explained_var = 1.0 - vf_rho
+        else:
+            vf_rho = 0.0
+            vf_explained_var = 0.0
 
         # Values are aligned with action positions, so index 0 always corresponds
         # to the value at the last prompt token (before generating token 0).
-        # Use non_aborted_mask (from attention_mask) instead of response_mask
-        # because response_mask can be post-processed (e.g. rollout correction).
-        prompt_end_values = values[non_aborted_mask, :1].squeeze(-1)
-        prompt_end_value_mean = torch.mean(prompt_end_values).detach().item()
+        # Use valid_training_seq_mask so training diagnostics reflect effective samples only.
+        prompt_end_values = values[valid_training_seq_mask, :1].squeeze(-1)
+        prompt_end_value_mean = _mean_or_zero(prompt_end_values)
 
     # Aborted samples and non-aborted response length statistics
     # response_length_non_aborted/*: statistics computed on non-aborted samples only
@@ -165,7 +185,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             torch.mean(torch.eq(non_aborted_response_length, max_response_length).float()).detach().item()
         )
     else:
-        raise ValueError("All samples are aborted, this should not happen.")
+        non_aborted_response_length_mean = 0.0
+        non_aborted_response_length_max = 0.0
+        non_aborted_response_length_min = 0.0
+        non_aborted_response_length_clip_ratio = 0.0
 
     metrics = {
         # score
@@ -177,25 +200,25 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/rewards/max": reward_max,
         "critic/rewards/min": reward_min,
         # adv
-        "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
-        "critic/advantages/max": torch.max(valid_adv).detach().item(),
-        "critic/advantages/min": torch.min(valid_adv).detach().item(),
+        "critic/advantages/mean": advantages_mean,
+        "critic/advantages/max": advantages_max,
+        "critic/advantages/min": advantages_min,
         # returns
-        "critic/returns/mean": torch.mean(valid_returns).detach().item(),
-        "critic/returns/max": torch.max(valid_returns).detach().item(),
-        "critic/returns/min": torch.min(valid_returns).detach().item(),
+        "critic/returns/mean": returns_mean,
+        "critic/returns/max": returns_max,
+        "critic/returns/min": returns_min,
         **(
             {
                 # values
-                "critic/values/mean": torch.mean(valid_values).detach().item(),
-                "critic/values/max": torch.max(valid_values).detach().item(),
-                "critic/values/min": torch.min(valid_values).detach().item(),
+                "critic/values/mean": values_mean,
+                "critic/values/max": values_max,
+                "critic/values/min": values_min,
                 # prompt end value (state value before generating first response token)
                 "critic/prompt_end_value/mean": prompt_end_value_mean,
                 # rho = Var(R - V_hat) / Var(R), using the same valid-token mask as vf_explained_var.
                 "critic/vf_rho": vf_rho,
                 # vf explained var
-                "critic/vf_explained_var": 1.0 - vf_rho,
+                "critic/vf_explained_var": vf_explained_var,
             }
             if use_critic
             else {}
@@ -239,6 +262,61 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     return metrics
 
 
+def compute_overlong_filtering_metrics(batch: DataProto) -> dict[str, float]:
+    if "is_overlong" not in batch.batch or "raw_response_mask" not in batch.batch:
+        return {}
+
+    is_overlong = batch.batch["is_overlong"].to(bool)
+    raw_response_mask = batch.batch["raw_response_mask"].to(torch.float32)
+    overlong_filtered_response_mask = batch.batch.get("overlong_filtered_response_mask", batch.batch["response_mask"])
+    overlong_filtered_response_mask = overlong_filtered_response_mask.to(torch.float32)
+    raw_valid_seq_mask = raw_response_mask.sum(dim=-1) > 0
+    valid_mask = overlong_filtered_response_mask.sum(dim=-1) > 0
+
+    raw_response_lengths = raw_response_mask.sum(dim=-1)
+    raw_response_tokens = raw_response_mask.sum()
+    valid_response_tokens = overlong_filtered_response_mask.sum()
+    masked_response_tokens = raw_response_tokens - valid_response_tokens
+
+    def _mean_by_group(values: torch.Tensor, group_mask: torch.Tensor) -> float:
+        selected = values[group_mask]
+        return _mean_or_zero(selected)
+
+    metrics = {
+        "overlong_filtering/sample_fraction": is_overlong.to(torch.float32).mean().detach().item(),
+        "overlong_filtering/masked_token_fraction": (
+            masked_response_tokens / (raw_response_tokens + 1e-8)
+        ).detach().item(),
+        "overlong_filtering/effective_batch_size_before": float(raw_valid_seq_mask.sum().item()),
+        "overlong_filtering/effective_batch_size_after": float(valid_mask.sum().item()),
+        "overlong_filtering/effective_response_tokens_before": raw_response_tokens.detach().item(),
+        "overlong_filtering/effective_response_tokens_after": valid_response_tokens.detach().item(),
+        "overlong_filtering/mean_response_length_valid": _mean_by_group(raw_response_lengths, valid_mask),
+        "overlong_filtering/mean_response_length_overlong": _mean_by_group(raw_response_lengths, is_overlong),
+    }
+
+    if "token_level_scores" in batch.batch:
+        sequence_score = batch.batch["token_level_scores"].sum(dim=-1)
+        metrics["overlong_filtering/score_mean_valid"] = _mean_by_group(sequence_score, valid_mask)
+        metrics["overlong_filtering/score_mean_overlong"] = _mean_by_group(sequence_score, is_overlong)
+
+    if "token_level_rewards" in batch.batch:
+        sequence_reward = batch.batch["token_level_rewards"].sum(dim=-1)
+        metrics["overlong_filtering/reward_mean_valid"] = _mean_by_group(sequence_reward, valid_mask)
+        metrics["overlong_filtering/reward_mean_overlong"] = _mean_by_group(sequence_reward, is_overlong)
+
+    if "acc" in batch.non_tensor_batch:
+        acc = torch.as_tensor(batch.non_tensor_batch["acc"], dtype=torch.float32)
+        metrics["overlong_filtering/success_mean_valid"] = _mean_by_group(acc, valid_mask.cpu())
+        metrics["overlong_filtering/success_mean_overlong"] = _mean_by_group(acc, is_overlong.cpu())
+    elif "acc" in batch.batch:
+        acc = batch.batch["acc"].to(torch.float32)
+        metrics["overlong_filtering/success_mean_valid"] = _mean_by_group(acc, valid_mask)
+        metrics["overlong_filtering/success_mean_overlong"] = _mean_by_group(acc, is_overlong)
+
+    return metrics
+
+
 def compute_grpo_baseline_metrics(batch: DataProto) -> dict[str, float]:
     """Compute GRPO's sequence-level baseline variance reduction metric.
 
@@ -253,11 +331,12 @@ def compute_grpo_baseline_metrics(batch: DataProto) -> dict[str, float]:
     if "token_level_rewards" not in batch.batch or "uid" not in batch.non_tensor_batch:
         return {}
 
-    sequence_rewards = batch.batch["token_level_rewards"].sum(dim=-1)
-    if sequence_rewards.numel() <= 1:
+    valid_seq_mask = batch.batch["response_mask"].sum(dim=-1) > 0
+    if valid_seq_mask.sum() <= 1:
         return {}
 
-    group_ids = batch.non_tensor_batch["uid"]
+    sequence_rewards = batch.batch["token_level_rewards"].sum(dim=-1)[valid_seq_mask]
+    group_ids = batch.non_tensor_batch["uid"][valid_seq_mask.cpu().numpy()]
     id2rewards = defaultdict(list)
     for i, group_id in enumerate(group_ids):
         id2rewards[group_id].append(sequence_rewards[i])
@@ -405,6 +484,15 @@ def compute_variance_proxy_metrics(batch: DataProto, gradient_norm: float = None
 
     # Get response mask to only consider valid tokens
     response_mask = batch.batch["response_mask"]
+    valid_seq_mask = response_mask.sum(dim=-1) > 0
+    if not valid_seq_mask.any():
+        return {
+            "variance_proxy/proxy1_signal_strength": gradient_norm**2 if gradient_norm is not None else 0.0,
+            "variance_proxy/proxy2_total_power": 0.0,
+            "variance_proxy/proxy3_pure_noise": 0.0,
+            "variance_proxy/expected_a_squared": 0.0,
+            "variance_proxy/expected_w": 0.0,
+        }
 
     # Use pre-computed rollout IS weights from batch (for variance proxy consistency with training loss)
     # IS weights are computed centrally in ray_trainer.py to avoid duplication
@@ -421,10 +509,10 @@ def compute_variance_proxy_metrics(batch: DataProto, gradient_norm: float = None
     # Get scalar advantages (mean over timesteps)
     advantages = batch.batch["advantages"]
     # Compute mean advantage per trajectory using masked_mean
-    advantages_scalar = verl_F.masked_mean(advantages, response_mask, axis=-1)
+    advantages_scalar = verl_F.masked_mean(advantages, response_mask, axis=-1)[valid_seq_mask]
 
     # Compute W values (sum over timesteps)
-    w_values = verl_F.masked_sum(w_per_timestep, response_mask, axis=-1)
+    w_values = verl_F.masked_sum(w_per_timestep, response_mask, axis=-1)[valid_seq_mask]
 
     # ====== COMPUTE VARIANCE PROXIES ======
     # Variance proxy should match the actual gradient computation:
@@ -439,12 +527,12 @@ def compute_variance_proxy_metrics(batch: DataProto, gradient_norm: float = None
     # Measures the average of squared gradient norms (Signal + Noise)
     if rollout_is_weights is not None:
         # Off-policy with IS correction applied: use clamped weights consistently with actual gradient computation
-        rollout_is_weights_scalar = verl_F.masked_mean(rollout_is_weights, response_mask, axis=-1)
+        rollout_is_weights_scalar = verl_F.masked_mean(rollout_is_weights, response_mask, axis=-1)[valid_seq_mask]
         # Recover original W (before IS correction was applied in line 657)
         # Clamp to avoid division by zero when IS weights are zero
         w_original = verl_F.masked_sum(
             w_per_timestep / torch.clamp((rollout_is_weights**2).detach(), min=1e-10), response_mask, axis=-1
-        )
+        )[valid_seq_mask]
         # Clamp W to avoid negative values (which would cause NaN in sqrt)
         w_original = torch.clamp(w_original, min=0.0)
         # Proxy 2 for off-policy: E[ρ̄² × A² × W]

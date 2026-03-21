@@ -117,6 +117,9 @@ trainer:
   # Whether to balance batch sizes across distributed workers
   balance_batch: True
 
+  # Whether to mask out samples that ended only because they hit the max response length
+  overlong_filtering: False
+
   # Number of epochs in training
   total_epochs: 30
 
