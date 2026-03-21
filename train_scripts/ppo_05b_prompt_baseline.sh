@@ -7,6 +7,9 @@ export SLURM_JOB_ID="05b_prompt_baseline"
 
 # When true, math_dapo incorrect answers get reward 0.0 instead of -1.0.
 MATH_DAPO_BINARY_REWARD=true
+# When true, responses that only stop because they hit max response length are
+# fully masked out of PPO/critic optimization.
+OVERLONG_FILTERING=false
 # RayPPOTrainer starts counting global PPO steps from 1 and begins actor
 # updates once global_steps >= trainer.critic_warmup.
 # Use +1 here to get exactly 50 critic-only optimization steps.
@@ -58,6 +61,7 @@ python3 -m verl.trainer.main_ppo \
   trainer.test_freq=50 \
   trainer.save_freq=50 \
   trainer.total_epochs=5 \
+  trainer.overlong_filtering=${OVERLONG_FILTERING} \
   trainer.logger='["console","wandb"]' \
   trainer.project_name="PPO_metamath" \
   trainer.experiment_name="qwen2.5_0.5B_prompt_baseline_${SLURM_JOB_ID}" \
