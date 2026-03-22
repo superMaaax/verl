@@ -94,6 +94,180 @@ def _mean_or_zero(values: torch.Tensor) -> float:
     return torch.mean(values).detach().item()
 
 
+def _variance_or_zero(values: torch.Tensor) -> float:
+    if values.numel() <= 1:
+        return 0.0
+    return torch.var(values.float(), unbiased=False).detach().item()
+
+
+def _safe_pearson_corr(values_a: torch.Tensor, values_b: torch.Tensor) -> float:
+    if values_a.numel() <= 1 or values_b.numel() <= 1:
+        return 0.0
+    values_a = values_a.float().reshape(-1)
+    values_b = values_b.float().reshape(-1)
+    values_a = values_a - values_a.mean()
+    values_b = values_b - values_b.mean()
+    denom = torch.sqrt(values_a.pow(2).mean() * values_b.pow(2).mean()).clamp_min(1e-8)
+    return ((values_a * values_b).mean() / denom).detach().item()
+
+
+def _safe_var(values: torch.Tensor) -> torch.Tensor:
+    values = values.float().reshape(-1)
+    if values.numel() <= 1:
+        return values.new_tensor(0.0)
+    return torch.var(values, unbiased=False)
+
+
+def _safe_variance_ratio(
+    numerator_values: torch.Tensor,
+    denominator_values: torch.Tensor,
+    eps: float = 1e-8,
+) -> tuple[float, float, float]:
+    numerator_var = _safe_var(numerator_values)
+    denominator_var = _safe_var(denominator_values)
+    if denominator_var <= eps:
+        return 1.0, numerator_var.detach().item(), denominator_var.detach().item()
+    ratio = numerator_var / denominator_var
+    return ratio.detach().item(), numerator_var.detach().item(), denominator_var.detach().item()
+
+
+def _get_non_tensor_batch(batch: DataProto) -> dict[str, Any]:
+    non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+    return non_tensor_batch if isinstance(non_tensor_batch, dict) else {}
+
+
+def _build_prompt_groups(prompt_ids: np.ndarray | list[Any] | None) -> list[list[int]]:
+    if prompt_ids is None:
+        return []
+    groups: dict[Any, list[int]] = defaultdict(list)
+    for idx, prompt_id in enumerate(np.asarray(prompt_ids, dtype=object).tolist()):
+        groups[prompt_id].append(idx)
+    return list(groups.values())
+
+
+def _compute_within_prompt_variance_ratio(
+    returns_tokenwise: torch.Tensor,
+    baseline_tokenwise: torch.Tensor,
+    response_mask: torch.Tensor,
+    prompt_ids: np.ndarray | list[Any] | None,
+) -> dict[str, float]:
+    groups = _build_prompt_groups(prompt_ids)
+    if not groups:
+        return {}
+
+    raw_advantages = returns_tokenwise - baseline_tokenwise
+    per_prompt_ratios: list[float] = []
+    pooled_centered_returns: list[torch.Tensor] = []
+    pooled_centered_advantages: list[torch.Tensor] = []
+
+    for row_indices in groups:
+        group_returns = torch.masked_select(returns_tokenwise[row_indices], response_mask[row_indices])
+        if group_returns.numel() <= 1:
+            continue
+        group_advantages = torch.masked_select(raw_advantages[row_indices], response_mask[row_indices])
+        group_ratio, _, _ = _safe_variance_ratio(group_advantages, group_returns)
+        per_prompt_ratios.append(group_ratio)
+        pooled_centered_returns.append(group_returns.float() - group_returns.float().mean())
+        pooled_centered_advantages.append(group_advantages.float() - group_advantages.float().mean())
+
+    if not per_prompt_ratios:
+        return {
+            "var_ratio_within_prompt_mean": 1.0,
+            "var_ratio_within_prompt_median": 1.0,
+            "var_ratio_within_prompt_pooled": 1.0,
+        }
+
+    pooled_ratio, _, _ = _safe_variance_ratio(
+        torch.cat(pooled_centered_advantages, dim=0),
+        torch.cat(pooled_centered_returns, dim=0),
+    )
+    ratios_tensor = torch.tensor(per_prompt_ratios, dtype=torch.float32)
+    return {
+        "var_ratio_within_prompt_mean": ratios_tensor.mean().item(),
+        "var_ratio_within_prompt_median": ratios_tensor.median().item(),
+        "var_ratio_within_prompt_pooled": pooled_ratio,
+    }
+
+
+def _compute_position_variance_ratios(
+    rollout_returns: torch.Tensor,
+    baseline_tokenwise: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> dict[str, float]:
+    position_specs: tuple[tuple[str, float | None], ...] = (
+        ("25", 0.25),
+        ("50", 0.50),
+        ("75", 0.75),
+        ("90", 0.90),
+        ("final", None),
+    )
+    valid_rows = response_mask.any(dim=-1)
+    if valid_rows.sum().item() <= 1:
+        return {}
+
+    valid_lengths = response_mask.sum(dim=-1).to(dtype=torch.long)[valid_rows]
+    valid_returns = rollout_returns[valid_rows].float()
+    valid_baseline = baseline_tokenwise[valid_rows].float()
+    metrics = {}
+
+    for label, fraction in position_specs:
+        if fraction is None:
+            position_idx = valid_lengths - 1
+        else:
+            position_idx = torch.ceil(valid_lengths.float() * fraction).to(dtype=torch.long) - 1
+        position_idx = position_idx.clamp(min=0)
+        row_idx = torch.arange(valid_baseline.shape[0], device=valid_baseline.device)
+        selected_baseline = valid_baseline[row_idx, position_idx]
+        ratio, _, _ = _safe_variance_ratio(valid_returns - selected_baseline, valid_returns)
+        metrics[f"var_ratio_global_pos_{label}"] = ratio
+        metrics[f"variance_reduction_gain_global_pos_{label}"] = 1.0 - ratio
+
+    return metrics
+
+
+def _compute_variance_ratio_metrics(
+    prefix: str,
+    rollout_returns: torch.Tensor,
+    baseline_tokenwise: torch.Tensor,
+    response_mask: torch.Tensor,
+    prompt_ids: np.ndarray | list[Any] | None,
+    include_position_metrics: bool = False,
+) -> tuple[dict[str, float], float, float]:
+    returns_tokenwise = rollout_returns.unsqueeze(-1).expand_as(baseline_tokenwise).float()
+    baseline_tokenwise = baseline_tokenwise.float()
+    flat_returns = torch.masked_select(returns_tokenwise, response_mask)
+    flat_raw_advantages = torch.masked_select(returns_tokenwise - baseline_tokenwise, response_mask)
+    global_ratio, raw_advantage_var, return_var = _safe_variance_ratio(flat_raw_advantages, flat_returns)
+
+    metrics = {
+        f"{prefix}/var_ratio_global": global_ratio,
+        f"{prefix}/variance_reduction_gain_global": 1.0 - global_ratio,
+    }
+
+    within_prompt_metrics = _compute_within_prompt_variance_ratio(
+        returns_tokenwise=returns_tokenwise,
+        baseline_tokenwise=baseline_tokenwise,
+        response_mask=response_mask,
+        prompt_ids=prompt_ids,
+    )
+    if "var_ratio_within_prompt_mean" in within_prompt_metrics:
+        within_prompt_metrics["var_ratio_within_prompt"] = within_prompt_metrics["var_ratio_within_prompt_mean"]
+    for name, value in within_prompt_metrics.items():
+        metrics[f"{prefix}/{name}"] = value
+        metrics[f"{prefix}/{name.replace('var_ratio', 'variance_reduction_gain')}"] = 1.0 - value
+
+    if include_position_metrics:
+        position_metrics = _compute_position_variance_ratios(
+            rollout_returns=rollout_returns,
+            baseline_tokenwise=baseline_tokenwise,
+            response_mask=response_mask,
+        )
+        for name, value in position_metrics.items():
+            metrics[f"{prefix}/{name}"] = value
+
+    return metrics, raw_advantage_var, return_var
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -152,6 +326,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     valid_returns = torch.masked_select(returns, response_mask)
     advantages_mean, advantages_max, advantages_min = _safe_mean_max_min(valid_adv)
     returns_mean, returns_max, returns_min = _safe_mean_max_min(valid_returns)
+    non_tensor_batch = _get_non_tensor_batch(batch)
 
     if use_critic:
         values = batch.batch["values"]
@@ -171,6 +346,93 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         # Use valid_training_seq_mask so training diagnostics reflect effective samples only.
         prompt_end_values = values[valid_training_seq_mask, :1].squeeze(-1)
         prompt_end_value_mean = _mean_or_zero(prompt_end_values)
+
+        prompt_residual_metrics = {}
+        if "prompt_prior_values" in batch.batch and "rollout_returns" in batch.batch:
+            prompt_prior_values = batch.batch["prompt_prior_values"]
+            rollout_returns = batch.batch["rollout_returns"]
+            repeated_rollout_returns = rollout_returns.unsqueeze(-1).expand_as(values)
+            prompt_ids = non_tensor_batch.get("uid")
+
+            valid_prompt_prior = prompt_prior_values[valid_training_seq_mask]
+            valid_rollout_returns = rollout_returns[valid_training_seq_mask]
+            valid_prompt_residual = valid_rollout_returns - valid_prompt_prior
+            valid_combined_residual = (repeated_rollout_returns - values)[response_mask]
+
+            prompt_prior_baseline = prompt_prior_values.unsqueeze(-1).expand_as(values) * response_mask.to(
+                dtype=values.dtype
+            )
+            prompt_prior_var_metrics, actor_raw_adv_var, actor_raw_return_var = _compute_variance_ratio_metrics(
+                prefix="prompt_prior",
+                rollout_returns=rollout_returns,
+                baseline_tokenwise=prompt_prior_baseline,
+                response_mask=response_mask,
+                prompt_ids=prompt_ids,
+                include_position_metrics=False,
+            )
+            prompt_residual_metrics.update(prompt_prior_var_metrics)
+            actor_baseline_metrics = {
+                f"baseline/{key.split('/', 1)[1]}": value for key, value in prompt_prior_var_metrics.items()
+            }
+
+            residual_values = batch.batch.get("residual_values")
+            if residual_values is not None:
+                valid_residual_values = residual_values[response_mask]
+                residual_var_metrics, _, _ = _compute_variance_ratio_metrics(
+                    prefix="residual",
+                    rollout_returns=rollout_returns,
+                    baseline_tokenwise=residual_values,
+                    response_mask=response_mask,
+                    prompt_ids=prompt_ids,
+                    include_position_metrics=True,
+                )
+                prompt_residual_metrics.update(residual_var_metrics)
+
+                combined_var_metrics, actor_raw_adv_var, actor_raw_return_var = _compute_variance_ratio_metrics(
+                    prefix="combined",
+                    rollout_returns=rollout_returns,
+                    baseline_tokenwise=values,
+                    response_mask=response_mask,
+                    prompt_ids=prompt_ids,
+                    include_position_metrics=True,
+                )
+                prompt_residual_metrics.update(combined_var_metrics)
+                actor_baseline_metrics = {
+                    f"baseline/{key.split('/', 1)[1]}": value for key, value in combined_var_metrics.items()
+                }
+                residual_mean = _mean_or_zero(valid_residual_values)
+                residual_return_corr = _safe_pearson_corr(
+                    valid_residual_values,
+                    repeated_rollout_returns[response_mask],
+                )
+            else:
+                residual_mean = 0.0
+                residual_return_corr = 0.0
+
+            prompt_residual_metrics.update(actor_baseline_metrics)
+            prompt_residual_metrics.update(
+                {
+                    "critic/prompt_prior_mean": _mean_or_zero(valid_prompt_prior),
+                    "critic/residual_mean": residual_mean,
+                    "critic/combined_value_mean": values_mean,
+                    "critic/prompt_prior_return_corr": _safe_pearson_corr(valid_prompt_prior, valid_rollout_returns),
+                    "critic/residual_return_corr": residual_return_corr,
+                    "critic/prompt_prior_vs_return_gap": _mean_or_zero(
+                        torch.abs(valid_prompt_prior - valid_rollout_returns)
+                    ),
+                    "critic/combined_vs_return_gap": _mean_or_zero(torch.abs(valid_combined_residual)),
+                    "critic/prompt_prior_residual_variance": _variance_or_zero(valid_prompt_residual),
+                    "critic/combined_residual_variance": _variance_or_zero(valid_combined_residual),
+                    "actor/raw_advantage_var": actor_raw_adv_var,
+                    "actor/raw_return_var": actor_raw_return_var,
+                    "actor/raw_advantage_var_ratio_vs_returns": (
+                        actor_raw_adv_var / max(actor_raw_return_var, 1e-8) if actor_raw_return_var > 0 else 1.0
+                    ),
+                    "actor/raw_advantage_var_ratio_vs_return_tokens": (
+                        actor_raw_adv_var / max(actor_raw_return_var, 1e-8) if actor_raw_return_var > 0 else 1.0
+                    ),
+                }
+            )
 
     # Aborted samples and non-aborted response length statistics
     # response_length_non_aborted/*: statistics computed on non-aborted samples only
@@ -219,6 +481,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
                 "critic/vf_rho": vf_rho,
                 # vf explained var
                 "critic/vf_explained_var": vf_explained_var,
+                **prompt_residual_metrics,
             }
             if use_critic
             else {}
@@ -247,14 +510,14 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     }
 
     # multi-turn conversation
-    if "__num_turns__" in batch.non_tensor_batch:
-        num_turns = batch.non_tensor_batch["__num_turns__"]
+    if "__num_turns__" in non_tensor_batch:
+        num_turns = non_tensor_batch["__num_turns__"]
         metrics["num_turns/min"] = num_turns.min()
         metrics["num_turns/max"] = num_turns.max()
         metrics["num_turns/mean"] = num_turns.mean()
 
-    if "tool_call_counts" in batch.non_tensor_batch:
-        tool_call_counts = batch.non_tensor_batch["tool_call_counts"]
+    if "tool_call_counts" in non_tensor_batch:
+        tool_call_counts = non_tensor_batch["tool_call_counts"]
         metrics["tool_call_counts/min"] = tool_call_counts.min()
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
@@ -328,15 +591,19 @@ def compute_grpo_baseline_metrics(batch: DataProto) -> dict[str, float]:
     baseline. To match the current GRPO advantage implementation, singleton
     groups use a zero baseline instead of subtracting their own reward.
     """
-    if "token_level_rewards" not in batch.batch or "uid" not in batch.non_tensor_batch:
+    non_tensor_batch = _get_non_tensor_batch(batch)
+    if "token_level_rewards" not in batch.batch or "uid" not in non_tensor_batch:
         return {}
 
-    valid_seq_mask = batch.batch["response_mask"].sum(dim=-1) > 0
+    response_mask = batch.batch.get("response_mask")
+    if response_mask is None:
+        response_mask = torch.ones_like(batch.batch["token_level_rewards"], dtype=torch.float32)
+    valid_seq_mask = response_mask.sum(dim=-1) > 0
     if valid_seq_mask.sum() <= 1:
         return {}
 
     sequence_rewards = batch.batch["token_level_rewards"].sum(dim=-1)[valid_seq_mask]
-    group_ids = batch.non_tensor_batch["uid"][valid_seq_mask.cpu().numpy()]
+    group_ids = non_tensor_batch["uid"][valid_seq_mask.cpu().numpy()]
     id2rewards = defaultdict(list)
     for i, group_id in enumerate(group_ids):
         id2rewards[group_id].append(sequence_rewards[i])

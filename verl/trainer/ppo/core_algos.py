@@ -110,6 +110,8 @@ class AdvantageEstimator(str, Enum):
     PROMPT_BASELINE = "prompt_baseline"
     PROMPT_BASELINE_BCE = "prompt_baseline_bce"
     PROMPT_BASELINE_REGRESSION = "prompt_baseline_regression"
+    PROMPT_RESIDUAL_BASELINE = "prompt_residual_baseline"
+    PROMPT_RESIDUAL_BASELINE_RAMP = "prompt_residual_baseline_ramp"
     ZERO_CRITIC = "zero_critic"
     GRPO = "grpo"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
@@ -359,6 +361,136 @@ def compute_prompt_baseline_advantage_return(
         advantages = verl_F.masked_whiten(advantages, response_mask)
         advantages = advantages * response_mask
 
+    return advantages, returns
+
+
+def compute_outcome_rollout_returns(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    gamma: float,
+) -> torch.Tensor:
+    """Compute a single rollout return per sample from token-level rewards."""
+    with torch.no_grad():
+        returns = torch.zeros_like(token_level_rewards)
+        running_return = torch.zeros(
+            token_level_rewards.size(0),
+            dtype=token_level_rewards.dtype,
+            device=token_level_rewards.device,
+        )
+
+        for t in reversed(range(token_level_rewards.shape[1])):
+            running_return = token_level_rewards[:, t] + gamma * running_return
+            returns[:, t] = running_return
+            running_return = running_return * response_mask[:, t]
+
+        valid_rows = response_mask.bool().any(dim=-1)
+        first_valid_idx = response_mask.bool().float().argmax(dim=-1)
+        rollout_returns = returns.gather(1, first_valid_idx.unsqueeze(-1)).squeeze(-1)
+        rollout_returns = rollout_returns * valid_rows.to(dtype=returns.dtype)
+    return rollout_returns
+
+
+def broadcast_outcome_rollout_returns(
+    rollout_returns: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Broadcast per-sample rollout returns over valid response positions."""
+    return rollout_returns.unsqueeze(-1).expand_as(response_mask) * response_mask.to(dtype=rollout_returns.dtype)
+
+
+def combine_prompt_residual_values(
+    prompt_prior_values: torch.Tensor,
+    residual_values: torch.Tensor,
+    response_mask: torch.Tensor,
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    """Combine prompt prior and residual token values into the actor baseline."""
+    if prompt_prior_values.dim() != 1:
+        raise ValueError(
+            "prompt_prior_values must have shape [batch] for prompt-residual baseline, "
+            f"got {tuple(prompt_prior_values.shape)}."
+        )
+    if residual_values.shape != response_mask.shape:
+        raise ValueError(
+            "residual_values and response_mask must have identical shapes for prompt-residual baseline, "
+            f"got {tuple(residual_values.shape)} and {tuple(response_mask.shape)}."
+        )
+    combined_values = prompt_prior_values.unsqueeze(-1).to(dtype=residual_values.dtype) + alpha * residual_values
+    return combined_values * response_mask.to(dtype=combined_values.dtype)
+
+
+def get_prompt_residual_alpha(
+    adv_estimator: AdvantageEstimator | str,
+    *,
+    config: Optional[AlgoConfig] = None,
+    global_step: Optional[int] = None,
+) -> float:
+    """Return the actor-side residual weight for prompt-residual baselines."""
+    if isinstance(adv_estimator, AdvantageEstimator):
+        adv_estimator = adv_estimator.value
+
+    prompt_residual_alpha = float(
+        getattr(config, "prompt_residual_alpha", 1.0) if config is not None else 1.0
+    )
+    if adv_estimator != AdvantageEstimator.PROMPT_RESIDUAL_BASELINE_RAMP.value:
+        return prompt_residual_alpha
+
+    ramp_steps = int(getattr(config, "prompt_residual_alpha_ramp_steps", 0) if config is not None else 0)
+    if ramp_steps <= 0:
+        return prompt_residual_alpha
+    step = 0 if global_step is None else max(int(global_step), 0)
+    return prompt_residual_alpha * min(1.0, step / ramp_steps)
+
+
+@register_adv_est(AdvantageEstimator.PROMPT_RESIDUAL_BASELINE)
+@register_adv_est(AdvantageEstimator.PROMPT_RESIDUAL_BASELINE_RAMP)
+def compute_prompt_residual_advantage_return(
+    token_level_rewards: torch.Tensor,
+    prompt_prior_values: torch.Tensor,
+    residual_values: torch.Tensor,
+    response_mask: torch.Tensor,
+    gamma: float,
+    alpha: float = 1.0,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute outcome-style advantages using prompt prior plus residual values."""
+    lam = kwargs.get("lam", 1.0)
+    if lam != 1.0:
+        raise ValueError(
+            "prompt_residual_baseline requires lam=1.0 because it uses a rollout-return minus baseline estimator."
+        )
+    if prompt_prior_values is None or residual_values is None:
+        raise ValueError(
+            "prompt_residual_baseline requires both prompt_prior_values and residual_values from the critic."
+        )
+    if token_level_rewards.shape != residual_values.shape:
+        raise ValueError(
+            "prompt_residual_baseline requires residual_values and token_level_rewards to have identical shapes, "
+            f"got {tuple(residual_values.shape)} and {tuple(token_level_rewards.shape)}."
+        )
+    if prompt_prior_values.shape[0] != token_level_rewards.shape[0]:
+        raise ValueError(
+            "prompt_residual_baseline requires prompt_prior_values.shape[0] to match batch size, "
+            f"got {tuple(prompt_prior_values.shape)} and batch={token_level_rewards.shape[0]}."
+        )
+
+    with torch.no_grad():
+        rollout_returns = compute_outcome_rollout_returns(
+            token_level_rewards=token_level_rewards,
+            response_mask=response_mask,
+            gamma=gamma,
+        )
+        returns = broadcast_outcome_rollout_returns(rollout_returns=rollout_returns, response_mask=response_mask)
+        combined_values = combine_prompt_residual_values(
+            prompt_prior_values=prompt_prior_values,
+            residual_values=residual_values,
+            response_mask=response_mask,
+            alpha=alpha,
+        )
+        advantages = (returns - combined_values) * response_mask
+        advantages = verl_F.masked_whiten(advantages, response_mask)
+        advantages = advantages * response_mask
     return advantages, returns
 
 
@@ -2131,6 +2263,75 @@ def compute_prompt_baseline_regression_value_loss(
         "critic/prompt_value_target_mean": verl_F.masked_mean(prompt_targets, prompt_mask),
     }
     return vf_loss, vf_clipfrac, mirrored_vpreds, metrics
+
+
+def _safe_pearson_corr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Return a stable Pearson correlation, or zero when undefined."""
+    if x.numel() <= 1 or y.numel() <= 1:
+        return x.new_tensor(0.0, dtype=torch.float32)
+    x = x.float().reshape(-1)
+    y = y.float().reshape(-1)
+    x = x - x.mean()
+    y = y - y.mean()
+    denom = torch.sqrt(x.pow(2).mean() * y.pow(2).mean()).clamp_min(1e-8)
+    return (x * y).mean() / denom
+
+
+def compute_prompt_residual_regression_value_loss(
+    prompt_prior_vpreds: torch.Tensor,
+    residual_vpreds: torch.Tensor,
+    rollout_returns: torch.Tensor,
+    response_mask: torch.Tensor,
+    prompt_loss_weight: float = 1.0,
+    residual_loss_weight: float = 1.0,
+    cliprange_value: Optional[float] = None,
+    loss_agg_mode: str = "token-mean",
+):
+    """Train the decomposed prompt-prior + residual critic with regression losses."""
+    del cliprange_value
+
+    if prompt_prior_vpreds.dim() != 1:
+        raise ValueError(
+            "prompt_prior_vpreds must have shape [batch] for prompt-residual regression, "
+            f"got {tuple(prompt_prior_vpreds.shape)}."
+        )
+    if residual_vpreds.shape != response_mask.shape:
+        raise ValueError(
+            "residual_vpreds and response_mask must have identical shapes for prompt-residual regression, "
+            f"got {tuple(residual_vpreds.shape)} and {tuple(response_mask.shape)}."
+        )
+    if rollout_returns.dim() != 1:
+        raise ValueError(
+            "rollout_returns must have shape [batch] for prompt-residual regression, "
+            f"got {tuple(rollout_returns.shape)}."
+        )
+    if rollout_returns.shape[0] != prompt_prior_vpreds.shape[0]:
+        raise ValueError(
+            "rollout_returns and prompt_prior_vpreds must agree on batch size for prompt-residual regression, "
+            f"got {tuple(rollout_returns.shape)} and {tuple(prompt_prior_vpreds.shape)}."
+        )
+
+    prompt_prior_vpreds = prompt_prior_vpreds.float()
+    residual_vpreds = residual_vpreds.float()
+    rollout_returns = rollout_returns.float()
+
+    prompt_targets = rollout_returns.unsqueeze(-1)
+    prompt_mask = (response_mask > 0).any(dim=-1, keepdim=True).to(dtype=prompt_prior_vpreds.dtype)
+    prompt_losses = (prompt_prior_vpreds.unsqueeze(-1) - prompt_targets) ** 2
+    prompt_loss = agg_loss(loss_mat=prompt_losses, loss_mask=prompt_mask, loss_agg_mode=loss_agg_mode)
+
+    residual_targets = (rollout_returns - prompt_prior_vpreds.detach()).unsqueeze(-1).expand_as(residual_vpreds)
+    residual_losses = (residual_vpreds - residual_targets) ** 2
+    residual_loss = agg_loss(loss_mat=residual_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    combined_vpreds = prompt_prior_vpreds.unsqueeze(-1) + residual_vpreds
+    vf_loss = prompt_loss_weight * prompt_loss + residual_loss_weight * residual_loss
+    vf_clipfrac = prompt_prior_vpreds.new_tensor(0.0)
+    metrics = {
+        "critic/prompt_prior_loss": prompt_loss,
+        "critic/residual_loss": residual_loss,
+    }
+    return vf_loss, vf_clipfrac, combined_vpreds, metrics
 
 
 def compute_prompt_baseline_bce_value_loss(

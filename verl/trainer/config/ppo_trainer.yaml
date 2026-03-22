@@ -72,6 +72,13 @@ algorithm:
   # Advantage estimator type: "gae", "prompt_baseline_regression", "zero_critic", "grpo", etc.
   adv_estimator: gae
 
+  # Final residual weight used by prompt-residual actor baselines
+  prompt_residual_alpha: 1.0
+
+  # Number of PPO steps used to ramp the residual weight in prompt_residual_baseline_ramp.
+  # Set to 0 to keep the schedule off unless it is overridden explicitly.
+  prompt_residual_alpha_ramp_steps: 0
+
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 

@@ -28,6 +28,9 @@ from verl.trainer.ppo.core_algos import (
     compute_grpo_outcome_advantage,
     compute_prompt_baseline_bce_value_loss,
     compute_prompt_baseline_advantage_return,
+    compute_prompt_baseline_regression_value_loss,
+    compute_prompt_residual_advantage_return,
+    compute_prompt_residual_regression_value_loss,
     compute_grpo_vectorized_outcome_advantage,
     compute_zero_critic_advantage_return,
     compute_rloo_outcome_advantage,
@@ -46,6 +49,7 @@ def mock_test_fn():
 class TestRegisterAdvEst(unittest.TestCase):
     def setUp(self):
         """Clear the registry before each test"""
+        self._original_registry = verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY.copy()
         verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY.clear()
         verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY = {
             "gae": lambda x: x * 2,
@@ -54,7 +58,7 @@ class TestRegisterAdvEst(unittest.TestCase):
         self.ADV_ESTIMATOR_REGISTRY = verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY
 
     def tearDown(self) -> None:
-        verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY.clear()
+        verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY = self._original_registry
         return super().tearDown()
 
     def test_register_new_function(self):
@@ -364,6 +368,117 @@ def test_compute_advantage_prompt_baseline_bce_matches_prompt_baseline_core_algo
     torch.testing.assert_close(output.batch["advantages"], expected_advantages)
 
 
+def test_compute_advantage_prompt_baseline_regression_matches_prompt_baseline_core_algo():
+    data = DataProto.from_single_dict(
+        {
+            "token_level_rewards": torch.tensor([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float32),
+            "response_mask": torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.float32),
+            "values": torch.tensor([[0.2, 5.0, 5.0], [0.6, 7.0, 7.0]], dtype=torch.float32),
+        }
+    )
+
+    output = compute_advantage(
+        data,
+        adv_estimator=AdvantageEstimator.PROMPT_BASELINE_REGRESSION,
+        gamma=1.0,
+        lam=1.0,
+        config=AlgoConfig(adv_estimator="prompt_baseline_regression"),
+    )
+
+    expected_advantages, expected_returns = compute_prompt_baseline_advantage_return(
+        token_level_rewards=data.batch["token_level_rewards"],
+        values=data.batch["values"],
+        response_mask=data.batch["response_mask"],
+        gamma=1.0,
+        lam=1.0,
+    )
+
+    torch.testing.assert_close(output.batch["returns"], expected_returns)
+    torch.testing.assert_close(output.batch["advantages"], expected_advantages)
+
+
+def test_compute_prompt_residual_advantage_return_uses_combined_baseline():
+    rewards = torch.tensor([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float32)
+    response_mask = torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.float32)
+    prompt_prior_values = torch.tensor([0.2, 0.6], dtype=torch.float32)
+    residual_values = torch.tensor([[0.0, 0.3, 0.0], [0.1, 0.2, 0.4]], dtype=torch.float32)
+
+    advantages, returns = compute_prompt_residual_advantage_return(
+        token_level_rewards=rewards,
+        prompt_prior_values=prompt_prior_values,
+        residual_values=residual_values,
+        response_mask=response_mask,
+        gamma=1.0,
+        alpha=0.5,
+        lam=1.0,
+    )
+
+    expected_returns = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]], dtype=torch.float32)
+    expected_values = torch.tensor([[0.2, 0.35, 0.0], [0.65, 0.7, 0.8]], dtype=torch.float32)
+    raw_advantages = (expected_returns - expected_values) * response_mask
+    expected_advantages = verl_F.masked_whiten(raw_advantages, response_mask) * response_mask
+
+    torch.testing.assert_close(returns, expected_returns)
+    torch.testing.assert_close(advantages, expected_advantages)
+
+
+def test_compute_advantage_prompt_residual_baseline_sets_actor_baseline_and_rollout_return():
+    data = DataProto.from_single_dict(
+        {
+            "token_level_rewards": torch.tensor([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float32),
+            "response_mask": torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.float32),
+            "prompt_prior_values": torch.tensor([0.2, 0.6], dtype=torch.float32),
+            "residual_values": torch.tensor([[0.0, 0.3, 0.0], [0.1, 0.2, 0.4]], dtype=torch.float32),
+            "values": torch.zeros((2, 3), dtype=torch.float32),
+        }
+    )
+
+    output = compute_advantage(
+        data,
+        adv_estimator=AdvantageEstimator.PROMPT_RESIDUAL_BASELINE,
+        gamma=1.0,
+        lam=1.0,
+        config=AlgoConfig(adv_estimator="prompt_residual_baseline", prompt_residual_alpha=0.5),
+    )
+
+    expected_values = torch.tensor([[0.2, 0.35, 0.0], [0.65, 0.7, 0.8]], dtype=torch.float32)
+    expected_rollout_returns = torch.tensor([1.0, 1.0], dtype=torch.float32)
+
+    torch.testing.assert_close(output.batch["values"], expected_values)
+    torch.testing.assert_close(output.batch["rollout_returns"], expected_rollout_returns)
+    assert output.meta_info["advantage_metrics"]["actor/residual_weight_alpha"] == 0.5
+
+
+def test_compute_advantage_prompt_residual_baseline_ramp_scales_alpha_by_step():
+    data = DataProto.from_single_dict(
+        {
+            "token_level_rewards": torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float32),
+            "response_mask": torch.tensor([[1, 1, 0]], dtype=torch.float32),
+            "prompt_prior_values": torch.tensor([0.4], dtype=torch.float32),
+            "residual_values": torch.tensor([[0.2, 0.6, 0.0]], dtype=torch.float32),
+            "values": torch.zeros((1, 3), dtype=torch.float32),
+        }
+    )
+
+    output = compute_advantage(
+        data,
+        adv_estimator=AdvantageEstimator.PROMPT_RESIDUAL_BASELINE_RAMP,
+        gamma=1.0,
+        lam=1.0,
+        global_step=50,
+        config=AlgoConfig(
+            adv_estimator="prompt_residual_baseline_ramp",
+            prompt_residual_alpha=1.0,
+            prompt_residual_alpha_ramp_steps=100,
+        ),
+    )
+
+    expected_values = torch.tensor([[0.5, 0.7, 0.0]], dtype=torch.float32)
+
+    torch.testing.assert_close(output.batch["values"], expected_values)
+    assert output.meta_info["advantage_metrics"]["actor/residual_weight_alpha"] == 0.5
+
+
 def test_prompt_baseline_bce_value_loss_uses_prompt_end_logit_only():
     vpred_logits_a = torch.logit(torch.tensor([[0.8, 0.01], [0.3, 0.99]], dtype=torch.float32))
     vpred_logits_b = torch.logit(torch.tensor([[0.8, 0.99], [0.3, 0.01]], dtype=torch.float32))
@@ -399,6 +514,70 @@ def test_prompt_baseline_bce_value_loss_uses_prompt_end_logit_only():
     torch.testing.assert_close(metrics_b["critic/prompt_success_prob_mean"], torch.tensor(0.55))
     torch.testing.assert_close(vf_clipfrac_a, torch.tensor(0.0))
     torch.testing.assert_close(vf_clipfrac_b, torch.tensor(0.0))
+
+
+def test_prompt_baseline_regression_value_loss_uses_prompt_end_value_only():
+    vpreds_a = torch.tensor([[0.8, 10.0], [0.3, -10.0]], dtype=torch.float32)
+    vpreds_b = torch.tensor([[0.8, -10.0], [0.3, 10.0]], dtype=torch.float32)
+    old_values = torch.tensor([[0.2, 0.2], [0.6, 0.6]], dtype=torch.float32)
+    returns = torch.tensor([[1.0, 1.0], [0.0, 0.0]], dtype=torch.float32)
+    response_mask = torch.tensor([[1, 1], [1, 1]], dtype=torch.float32)
+
+    vf_loss_a, vf_clipfrac_a, mirrored_vpreds_a, metrics_a = compute_prompt_baseline_regression_value_loss(
+        vpreds=vpreds_a,
+        returns=returns,
+        values=old_values,
+        response_mask=response_mask,
+        cliprange_value=10.0,
+    )
+    vf_loss_b, vf_clipfrac_b, mirrored_vpreds_b, metrics_b = compute_prompt_baseline_regression_value_loss(
+        vpreds=vpreds_b,
+        returns=returns,
+        values=old_values,
+        response_mask=response_mask,
+        cliprange_value=10.0,
+    )
+
+    expected_loss = 0.5 * torch.mean((torch.tensor([[0.8], [0.3]], dtype=torch.float32) - torch.tensor([[1.0], [0.0]], dtype=torch.float32)) ** 2)
+    expected_mirrored_vpreds = torch.tensor([[0.8, 0.8], [0.3, 0.3]], dtype=torch.float32)
+
+    torch.testing.assert_close(vf_loss_a, expected_loss)
+    torch.testing.assert_close(vf_loss_b, expected_loss)
+    torch.testing.assert_close(mirrored_vpreds_a, expected_mirrored_vpreds)
+    torch.testing.assert_close(mirrored_vpreds_b, expected_mirrored_vpreds)
+    torch.testing.assert_close(metrics_a["critic/prompt_value_pred_mean"], torch.tensor(0.55))
+    torch.testing.assert_close(metrics_b["critic/prompt_value_pred_mean"], torch.tensor(0.55))
+    torch.testing.assert_close(metrics_a["critic/prompt_value_target_mean"], torch.tensor(0.5))
+    torch.testing.assert_close(metrics_b["critic/prompt_value_target_mean"], torch.tensor(0.5))
+    torch.testing.assert_close(vf_clipfrac_a, torch.tensor(0.0))
+    torch.testing.assert_close(vf_clipfrac_b, torch.tensor(0.0))
+
+
+def test_prompt_residual_regression_value_loss_uses_stop_grad_prompt_target_decomposition():
+    prompt_prior_vpreds = torch.tensor([0.2, 0.6], dtype=torch.float32)
+    residual_vpreds = torch.tensor([[0.1, 0.2], [0.3, 0.4]], dtype=torch.float32)
+    rollout_returns = torch.tensor([1.0, 0.0], dtype=torch.float32)
+    response_mask = torch.tensor([[1, 1], [1, 0]], dtype=torch.float32)
+
+    vf_loss, vf_clipfrac, combined_vpreds, metrics = compute_prompt_residual_regression_value_loss(
+        prompt_prior_vpreds=prompt_prior_vpreds,
+        residual_vpreds=residual_vpreds,
+        rollout_returns=rollout_returns,
+        response_mask=response_mask,
+        prompt_loss_weight=1.0,
+        residual_loss_weight=1.0,
+    )
+
+    expected_prompt_loss = torch.tensor((0.64 + 0.36) / 2, dtype=torch.float32)
+    expected_residual_loss = torch.tensor((0.49 + 0.36 + 0.81) / 3, dtype=torch.float32)
+    expected_total_loss = expected_prompt_loss + expected_residual_loss
+    expected_combined_vpreds = torch.tensor([[0.3, 0.4], [0.9, 1.0]], dtype=torch.float32)
+
+    torch.testing.assert_close(vf_loss, expected_total_loss)
+    torch.testing.assert_close(vf_clipfrac, torch.tensor(0.0))
+    torch.testing.assert_close(combined_vpreds, expected_combined_vpreds)
+    torch.testing.assert_close(metrics["critic/prompt_prior_loss"], expected_prompt_loss)
+    torch.testing.assert_close(metrics["critic/residual_loss"], expected_residual_loss)
 
 
 def test_prompt_baseline_bce_value_loss_rejects_targets_outside_unit_interval():

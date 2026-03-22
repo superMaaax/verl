@@ -235,6 +235,7 @@ def compute_advantage(
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    global_step: Optional[int] = None,
 ) -> DataProto:
     """Compute advantage estimates for policy optimization.
 
@@ -250,6 +251,7 @@ def compute_advantage(
         norm_adv_by_std_in_grpo (bool, optional): Whether to normalize advantages by standard deviation in
             GRPO. Defaults to True.
         config (dict, optional): Configuration dictionary for algorithm settings. Defaults to None.
+        global_step (int, optional): Current PPO step, used by scheduled prompt-residual baselines.
 
     Returns:
         DataProto: The updated data with computed advantages and returns.
@@ -320,6 +322,59 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        data.batch["rollout_returns"] = core_algos.compute_outcome_rollout_returns(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            gamma=gamma,
+        )
+        data.batch["prompt_prior_values"] = data.batch["values"][:, 0]
+        if config.get("use_pf_ppo", False) and valid_sample_mask.any():
+            data = core_algos.compute_pf_ppo_reweight_data(
+                data,
+                config.pf_ppo.get("reweight_method"),
+                config.pf_ppo.get("weight_pow"),
+            )
+    elif adv_estimator in (
+        AdvantageEstimator.PROMPT_RESIDUAL_BASELINE,
+        AdvantageEstimator.PROMPT_RESIDUAL_BASELINE_RAMP,
+    ):
+        if "prompt_prior_values" not in data.batch or "residual_values" not in data.batch:
+            raise ValueError(
+                f"algorithm.adv_estimator={adv_estimator.value} requires both prompt_prior_values and "
+                "residual_values from the critic. Ensure the prompt-residual critic is enabled and values "
+                "were computed before advantage calculation."
+            )
+        alpha = core_algos.get_prompt_residual_alpha(
+            adv_estimator,
+            config=config,
+            global_step=global_step,
+        )
+        advantages, returns = core_algos.compute_prompt_residual_advantage_return(
+            token_level_rewards=data.batch["token_level_rewards"],
+            prompt_prior_values=data.batch["prompt_prior_values"],
+            residual_values=data.batch["residual_values"],
+            response_mask=data.batch["response_mask"],
+            gamma=gamma,
+            lam=lam,
+            alpha=alpha,
+            config=config,
+        )
+        rollout_returns = core_algos.compute_outcome_rollout_returns(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            gamma=gamma,
+        )
+        combined_values = core_algos.combine_prompt_residual_values(
+            prompt_prior_values=data.batch["prompt_prior_values"],
+            residual_values=data.batch["residual_values"],
+            response_mask=data.batch["response_mask"],
+            alpha=alpha,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+        data.batch["rollout_returns"] = rollout_returns
+        data.batch["values"] = combined_values
+        data.meta_info["advantage_metrics"] = {"actor/residual_weight_alpha": alpha}
         if config.get("use_pf_ppo", False) and valid_sample_mask.any():
             data = core_algos.compute_pf_ppo_reweight_data(
                 data,
@@ -967,8 +1022,18 @@ class RayPPOTrainer:
                 critic_cfg.value_loss_mode = "prompt_baseline_regression"
             elif self.config.algorithm.adv_estimator == AdvantageEstimator.PROMPT_BASELINE_BCE:
                 critic_cfg.value_loss_mode = "prompt_baseline_bce"
+            elif self.config.algorithm.adv_estimator in (
+                AdvantageEstimator.PROMPT_RESIDUAL_BASELINE,
+                AdvantageEstimator.PROMPT_RESIDUAL_BASELINE_RAMP,
+            ):
+                critic_cfg.value_loss_mode = "prompt_residual_regression"
 
             if self.use_legacy_worker_impl == "disable":
+                if critic_cfg.value_loss_mode == "prompt_residual_regression":
+                    raise ValueError(
+                        f"algorithm.adv_estimator={self.config.algorithm.adv_estimator} is currently supported only "
+                        "with the legacy FSDP critic worker. Set trainer.use_legacy_worker_impl to 'auto' or 'enable'."
+                    )
                 # convert critic_cfg into TrainingWorkerConfig
                 from verl.workers.engine_workers import TrainingWorkerConfig
 
@@ -1757,7 +1822,11 @@ class RayPPOTrainer:
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
+                            global_step=self.global_steps,
                         )
+                        advantage_metrics = batch.meta_info.pop("advantage_metrics", None)
+                        if advantage_metrics is not None:
+                            metrics.update(advantage_metrics)
                         all_training_tokens_masked = batch.batch["response_mask"].sum().item() == 0
                         if self.config.trainer.get("overlong_filtering", False):
                             metrics["overlong_filtering/all_training_tokens_masked"] = int(all_training_tokens_masked)

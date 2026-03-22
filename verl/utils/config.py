@@ -125,6 +125,44 @@ def validate_config(
                 "algorithm.adv_estimator=prompt_baseline_bce requires critic.value_head_type=scalar "
                 "because it interprets the critic head as a single Bernoulli logit."
             )
+    if config.algorithm.adv_estimator in (
+        AdvantageEstimator.PROMPT_RESIDUAL_BASELINE,
+        AdvantageEstimator.PROMPT_RESIDUAL_BASELINE_RAMP,
+    ):
+        if config.algorithm.lam != 1.0:
+            raise ValueError(
+                f"algorithm.adv_estimator={config.algorithm.adv_estimator} requires algorithm.lam=1.0 "
+                "because it uses a rollout-return minus combined baseline estimator."
+            )
+        if config.critic.value_head_type != "scalar":
+            raise ValueError(
+                f"algorithm.adv_estimator={config.algorithm.adv_estimator} requires critic.value_head_type=scalar "
+                "because the decomposed prompt/residual critic is currently scalar-only."
+            )
+        if config.critic.strategy not in {"fsdp", "fsdp2"}:
+            raise ValueError(
+                f"algorithm.adv_estimator={config.algorithm.adv_estimator} currently supports only "
+                "critic.strategy in {'fsdp', 'fsdp2'}."
+            )
+        use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        if use_legacy_worker_impl == "disable":
+            raise ValueError(
+                f"algorithm.adv_estimator={config.algorithm.adv_estimator} is currently supported only "
+                "with the legacy FSDP critic worker. Set trainer.use_legacy_worker_impl to 'auto' or 'enable'."
+            )
+        if not 0.0 <= float(config.algorithm.prompt_residual_alpha) <= 1.0:
+            raise ValueError(
+                "algorithm.prompt_residual_alpha must be in [0, 1] for prompt-residual baselines, "
+                f"got {config.algorithm.prompt_residual_alpha}."
+            )
+        if (
+            config.algorithm.adv_estimator == AdvantageEstimator.PROMPT_RESIDUAL_BASELINE_RAMP
+            and int(config.algorithm.prompt_residual_alpha_ramp_steps) <= 0
+        ):
+            raise ValueError(
+                "algorithm.adv_estimator=prompt_residual_baseline_ramp requires "
+                "algorithm.prompt_residual_alpha_ramp_steps > 0."
+            )
 
     actor_update_interval = int(config.trainer.get("actor_update_interval", 1))
     if actor_update_interval < 1:

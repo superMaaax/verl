@@ -448,6 +448,85 @@ class TestComputeDataMetrics(unittest.TestCase):
         metrics = compute_data_metrics(batch, use_critic=True)
         self.assertAlmostEqual(metrics["critic/prompt_end_value/mean"], 1.0)
 
+    def test_compute_data_metrics_logs_prompt_residual_variance_reduction_metrics(self):
+        batch = MagicMock()
+        rollout_returns = torch.tensor([0.0, 1.0, 1.0, 0.0], dtype=torch.float32)
+        prompt_prior_values = torch.tensor([0.5, 0.5, 0.5, 0.5], dtype=torch.float32)
+        residual_values = torch.tensor(
+            [
+                [-0.5, -0.5],
+                [0.5, 0.5],
+                [0.5, 0.5],
+                [-0.5, -0.5],
+            ],
+            dtype=torch.float32,
+        )
+        combined_values = prompt_prior_values.unsqueeze(-1) + residual_values
+
+        batch.batch = {
+            "token_level_scores": torch.tensor(
+                [
+                    [0.0, 0.0],
+                    [1.0, 0.0],
+                    [1.0, 0.0],
+                    [0.0, 0.0],
+                ],
+                dtype=torch.float32,
+            ),
+            "token_level_rewards": torch.tensor(
+                [
+                    [0.0, 0.0],
+                    [1.0, 0.0],
+                    [1.0, 0.0],
+                    [0.0, 0.0],
+                ],
+                dtype=torch.float32,
+            ),
+            "advantages": torch.zeros((4, 2), dtype=torch.float32),
+            "returns": rollout_returns.unsqueeze(-1).expand(4, 2).clone(),
+            "responses": torch.zeros((4, 2), dtype=torch.float32),
+            "attention_mask": torch.tensor(
+                [
+                    [1, 1, 1, 1],
+                    [1, 1, 1, 1],
+                    [1, 1, 1, 1],
+                    [1, 1, 1, 1],
+                ]
+            ),
+            "response_mask": torch.tensor(
+                [
+                    [1, 1],
+                    [1, 1],
+                    [1, 1],
+                    [1, 1],
+                ]
+            ),
+            "values": combined_values,
+            "prompt_prior_values": prompt_prior_values,
+            "residual_values": residual_values,
+            "rollout_returns": rollout_returns,
+        }
+        batch.non_tensor_batch = {
+            "uid": np.array(["a", "a", "b", "b"], dtype=object),
+        }
+
+        metrics = compute_data_metrics(batch, use_critic=True)
+
+        self.assertAlmostEqual(metrics["prompt_prior/var_ratio_global"], 1.0)
+        self.assertAlmostEqual(metrics["prompt_prior/var_ratio_within_prompt_mean"], 1.0)
+        self.assertAlmostEqual(metrics["prompt_prior/var_ratio_within_prompt_median"], 1.0)
+        self.assertAlmostEqual(metrics["prompt_prior/var_ratio_within_prompt_pooled"], 1.0)
+        self.assertAlmostEqual(metrics["combined/var_ratio_global"], 0.0)
+        self.assertAlmostEqual(metrics["combined/var_ratio_within_prompt_mean"], 0.0)
+        self.assertAlmostEqual(metrics["combined/var_ratio_within_prompt_pooled"], 0.0)
+        self.assertAlmostEqual(metrics["baseline/var_ratio_global"], 0.0)
+        self.assertAlmostEqual(metrics["baseline/var_ratio_within_prompt_mean"], 0.0)
+        self.assertAlmostEqual(metrics["actor/raw_advantage_var"], 0.0)
+        self.assertAlmostEqual(metrics["actor/raw_advantage_var_ratio_vs_returns"], 0.0)
+        self.assertAlmostEqual(metrics["baseline/variance_reduction_gain_global"], 1.0)
+        self.assertAlmostEqual(metrics["baseline/var_ratio_global_pos_final"], 0.0)
+        self.assertAlmostEqual(metrics["combined/var_ratio_global_pos_50"], 0.0)
+
 
 class TestComputeGRPOBaselineMetrics(unittest.TestCase):
     def test_compute_grpo_baseline_metrics_matches_group_baseline_formula(self):

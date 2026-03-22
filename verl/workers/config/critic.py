@@ -71,7 +71,11 @@ class CriticConfig(BaseConfig):
         value_target_scale_max (float): Raw scalar maximum for affine scaling mode.
         value_target_out_of_range (str): Behavior when scaled targets are outside support.
         value_loss_mode (str): Critic objective variant, e.g. "ppo_regression",
-            "prompt_baseline_regression", or "prompt_baseline_bce".
+            "prompt_baseline_regression", "prompt_baseline_bce", or "prompt_residual_regression".
+        prompt_residual_prompt_loss_weight (float): Weight on the prompt-prior regression term when
+            value_loss_mode="prompt_residual_regression".
+        prompt_residual_residual_loss_weight (float): Weight on the residual regression term when
+            value_loss_mode="prompt_residual_regression".
         loss_agg_mode (str): Loss aggregation mode.
         checkpoint (Dict[str, Any]): Checkpoint configuration.
         profiler (Dict[str, Any]): Profiler configuration.
@@ -116,6 +120,8 @@ class CriticConfig(BaseConfig):
     value_target_scale_max: float = 1.0
     value_target_out_of_range: str = "error"
     value_loss_mode: str = "ppo_regression"
+    prompt_residual_prompt_loss_weight: float = 1.0
+    prompt_residual_residual_loss_weight: float = 1.0
     loss_agg_mode: str = "token-mean"
     ppo_micro_batch_size: Optional[int] = None
     engine: BaseConfig = field(default_factory=BaseConfig)
@@ -159,11 +165,22 @@ class CriticConfig(BaseConfig):
         apply_value_head_spec_to_hf_config(self.model_config.hf_config, value_spec)
         apply_value_head_architecture_spec_to_hf_config(self.model_config.hf_config, value_head_arch_spec)
 
-        if self.value_loss_mode not in {"ppo_regression", "prompt_baseline_regression", "prompt_baseline_bce"}:
+        if self.value_loss_mode not in {
+            "ppo_regression",
+            "prompt_baseline_regression",
+            "prompt_baseline_bce",
+            "prompt_residual_regression",
+        }:
             raise ValueError(
                 "critic.value_loss_mode must be one of "
-                "['ppo_regression', 'prompt_baseline_regression', 'prompt_baseline_bce'], "
+                "['ppo_regression', 'prompt_baseline_regression', 'prompt_baseline_bce', "
+                "'prompt_residual_regression'], "
                 f"got {self.value_loss_mode!r}."
+            )
+        if self.prompt_residual_prompt_loss_weight < 0 or self.prompt_residual_residual_loss_weight < 0:
+            raise ValueError(
+                "critic.prompt_residual_prompt_loss_weight and "
+                "critic.prompt_residual_residual_loss_weight must both be >= 0."
             )
 
         if value_head_arch_spec.is_recurrent() and self.strategy not in {"fsdp", "fsdp2"}:

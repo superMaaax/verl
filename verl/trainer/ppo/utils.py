@@ -99,6 +99,8 @@ def need_critic(config: DictConfig) -> bool:
         AdvantageEstimator.PROMPT_BASELINE,
         AdvantageEstimator.PROMPT_BASELINE_REGRESSION,
         AdvantageEstimator.PROMPT_BASELINE_BCE,
+        AdvantageEstimator.PROMPT_RESIDUAL_BASELINE,
+        AdvantageEstimator.PROMPT_RESIDUAL_BASELINE_RAMP,
     ):
         return True
     else:

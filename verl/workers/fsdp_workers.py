@@ -1446,6 +1446,7 @@ class CriticWorker(Worker, DistProfilerExtension):
                 value_head_init_mean=config.model.get("value_head_init_mean", 0.0),
                 value_head_init_std=config.model.get("value_head_init_std", None),
                 value_head_init_method=config.model.get("value_head_init_method", None),
+                use_prompt_residual_value_heads=config.value_loss_mode == "prompt_residual_regression",
             )
 
             use_remove_padding = config.model.get("use_remove_padding", False)
@@ -1661,8 +1662,11 @@ class CriticWorker(Worker, DistProfilerExtension):
         # perform forward computation
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on critic.compute_values
-            values = self.critic.compute_values(data=data)
-            output = DataProto.from_dict(tensors={"values": values})
+            critic_outputs = self.critic.compute_values(data=data)
+            if isinstance(critic_outputs, dict):
+                output = DataProto.from_dict(tensors=critic_outputs)
+            else:
+                output = DataProto.from_dict(tensors={"values": critic_outputs})
 
         output = output.to("cpu")
         if self._is_offload_param:

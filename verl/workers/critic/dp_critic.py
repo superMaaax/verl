@@ -66,8 +66,39 @@ class DataParallelPPOCritic(BasePPOCritic):
                 return metrics
         return {}
 
+    def _use_prompt_residual_regression(self) -> bool:
+        return self.config.value_loss_mode == "prompt_residual_regression"
+
+    def _prompt_prior_head(self) -> nn.Module:
+        prompt_prior_head = getattr(self.critic_module, "prompt_prior_head", None)
+        if not isinstance(prompt_prior_head, nn.Module):
+            raise RuntimeError(
+                "Prompt-residual critic expected `critic_module.prompt_prior_head`, but it was not found."
+            )
+        return prompt_prior_head
+
+    def _compute_prompt_prior_values(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        response_length: int,
+    ) -> torch.Tensor:
+        prompt_mask = attention_mask[:, :-response_length]
+        prompt_lengths = prompt_mask.sum(dim=-1)
+        if torch.any(prompt_lengths <= 0):
+            raise ValueError(
+                "Prompt-residual critic requires at least one prompt token per sample so the prompt prior "
+                "can read the prompt-end hidden state."
+            )
+        prompt_end_indices = (prompt_lengths - 1).to(dtype=torch.long)
+        batch_indices = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+        prompt_end_hidden = hidden_states[batch_indices, prompt_end_indices]
+        prompt_prior_values = self._prompt_prior_head()(prompt_end_hidden)
+        return prompt_prior_values.squeeze(-1)
+
     def _forward_micro_batch(self, micro_batch):
         is_categorical_value = self.value_spec.is_categorical()
+        use_prompt_residual = self._use_prompt_residual_regression()
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
@@ -113,6 +144,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                     attention_mask=None,
                     position_ids=position_ids_rmpad,
                     **multi_modal_inputs,
+                    output_hidden_states=use_prompt_residual,
                     use_cache=False,
                 )  # prevent model thinks we are generating
 
@@ -130,23 +162,43 @@ class DataParallelPPOCritic(BasePPOCritic):
                     if not is_categorical_value:
                         values_rmpad = values_rmpad.squeeze(-1)
 
+                hidden_states_rmpad = None
+                if use_prompt_residual:
+                    if hasattr(self.critic_module, "v_head"):
+                        raise RuntimeError(
+                            "Prompt-residual critic requires a HuggingFace token-classification model. "
+                            "TRL value-head critics are not supported."
+                        )
+                    hidden_states_rmpad = output.hidden_states[-1].squeeze(0)
+
                 # gather output if sp > 1
                 if self.ulysses_sequence_parallel_size > 1:
                     values_rmpad = gather_outputs_and_unpad(
                         values_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
                     )
+                    if hidden_states_rmpad is not None:
+                        hidden_states_rmpad = gather_outputs_and_unpad(
+                            hidden_states_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
 
                 # pad it back
                 values = pad_input(values_rmpad, indices=indices, batch=batch, seqlen=seqlen)
                 if not is_categorical_value:
                     values = values.squeeze(-1)
                 values = values[:, -response_length - 1 : -1]
+                hidden_states = None
+                if hidden_states_rmpad is not None:
+                    hidden_states = pad_input(hidden_states_rmpad, indices=indices, batch=batch, seqlen=seqlen)
             else:
                 output = self.critic_module(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     **multi_modal_inputs,
+                    output_hidden_states=use_prompt_residual,
                     use_cache=False,
                 )  # prevent model thinks we are generating
                 if hasattr(self.critic_module, "v_head"):
@@ -162,7 +214,28 @@ class DataParallelPPOCritic(BasePPOCritic):
                 values = values[:, -response_length - 1 : -1]
                 if not is_categorical_value:
                     values = values.squeeze(-1)
-            return values
+                hidden_states = output.hidden_states[-1] if use_prompt_residual else None
+
+            if not use_prompt_residual:
+                return values
+
+            if is_categorical_value:
+                raise ValueError("Prompt-residual critic currently requires critic.value_head_type=scalar.")
+            if hidden_states is None:
+                raise RuntimeError("Prompt-residual critic expected final hidden states, but none were returned.")
+
+            prompt_prior_values = self._compute_prompt_prior_values(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                response_length=response_length,
+            )
+            residual_values = values
+            combined_values = prompt_prior_values.unsqueeze(-1) + residual_values
+            return {
+                "values": combined_values,
+                "prompt_prior_values": prompt_prior_values,
+                "residual_values": residual_values,
+            }
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -183,7 +256,7 @@ class DataParallelPPOCritic(BasePPOCritic):
         return grad_norm
 
     @GPUMemoryLogger(role="dp critic", logger=logger)
-    def compute_values(self, data: DataProto) -> torch.Tensor:
+    def compute_values(self, data: DataProto) -> torch.Tensor | dict[str, torch.Tensor]:
         self.critic_module.eval()
         micro_batch_size = data.meta_info["micro_batch_size"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
@@ -203,26 +276,37 @@ class DataParallelPPOCritic(BasePPOCritic):
         else:
             micro_batches = data.split(micro_batch_size)
 
-        values_lst = []
+        output_lists: dict[str, list[torch.Tensor]] = {"values": []}
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                values = self._forward_micro_batch(model_inputs)
-            values_lst.append(values)
-        values = torch.concat(values_lst, dim=0)
+                model_output = self._forward_micro_batch(model_inputs)
+            if isinstance(model_output, dict):
+                for key, value in model_output.items():
+                    output_lists.setdefault(key, []).append(value)
+            else:
+                output_lists["values"].append(model_output)
+
+        critic_outputs = {key: torch.concat(value_list, dim=0) for key, value_list in output_lists.items()}
 
         if use_dynamic_bsz:
-            values = restore_dynamic_batch(values, batch_idx_list)
+            critic_outputs = {
+                key: restore_dynamic_batch(value, batch_idx_list) for key, value in critic_outputs.items()
+            }
 
         if self.value_spec.is_categorical():
-            values, _, _ = value_logits_to_scalar_expectation(values, self.value_spec)
+            critic_outputs["values"], _, _ = value_logits_to_scalar_expectation(critic_outputs["values"], self.value_spec)
 
         if "response_mask" in data.batch:
-            response_mask = data.batch["response_mask"]
-            response_mask = response_mask.to(values.device)
-            values = values * response_mask  # Only action tokens have values
-        return values
+            response_mask = data.batch["response_mask"].to(critic_outputs["values"].device)
+            critic_outputs["values"] = critic_outputs["values"] * response_mask  # Only action tokens have values
+            if "residual_values" in critic_outputs:
+                critic_outputs["residual_values"] = critic_outputs["residual_values"] * response_mask
+
+        if len(critic_outputs) == 1:
+            return critic_outputs["values"]
+        return critic_outputs
 
     @GPUMemoryLogger(role="dp critic", logger=logger)
     def update_critic(self, data: DataProto):
@@ -232,7 +316,11 @@ class DataParallelPPOCritic(BasePPOCritic):
             "critic/vf_loss": 0.0,
         }
 
-        select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns"]
+        select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids"]
+        if self._use_prompt_residual_regression():
+            select_keys.append("rollout_returns")
+        else:
+            select_keys.extend(["values", "returns"])
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
@@ -260,17 +348,41 @@ class DataParallelPPOCritic(BasePPOCritic):
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
-                    values = model_inputs["values"]
-                    returns = model_inputs["returns"]
 
-                    vpreds_or_logits = self._forward_micro_batch(model_inputs)
-                    if self.config.value_loss_mode == "prompt_baseline_regression":
+                    model_output = self._forward_micro_batch(model_inputs)
+                    if self.config.value_loss_mode == "prompt_residual_regression":
+                        if self.value_spec.is_categorical():
+                            raise ValueError(
+                                "critic.value_loss_mode=prompt_residual_regression requires "
+                                "critic.value_head_type=scalar."
+                            )
+                        if not isinstance(model_output, dict):
+                            raise RuntimeError(
+                                "Prompt-residual critic expected structured forward outputs with prompt and residual "
+                                "values, but received a tensor."
+                            )
+                        rollout_returns = model_inputs["rollout_returns"]
+                        vf_loss, vf_clipfrac, vpreds, categorical_metrics = (
+                            core_algos.compute_prompt_residual_regression_value_loss(
+                                prompt_prior_vpreds=model_output["prompt_prior_values"],
+                                residual_vpreds=model_output["residual_values"],
+                                rollout_returns=rollout_returns,
+                                response_mask=response_mask,
+                                prompt_loss_weight=self.config.prompt_residual_prompt_loss_weight,
+                                residual_loss_weight=self.config.prompt_residual_residual_loss_weight,
+                                cliprange_value=self.config.cliprange_value,
+                                loss_agg_mode=self.config.loss_agg_mode,
+                            )
+                        )
+                    elif self.config.value_loss_mode == "prompt_baseline_regression":
                         if self.value_spec.is_categorical():
                             raise ValueError(
                                 "critic.value_loss_mode=prompt_baseline_regression requires "
                                 "critic.value_head_type=scalar."
                             )
-                        vpreds = vpreds_or_logits
+                        values = model_inputs["values"]
+                        returns = model_inputs["returns"]
+                        vpreds = model_output
                         vf_loss, vf_clipfrac, vpreds, categorical_metrics = (
                             core_algos.compute_prompt_baseline_regression_value_loss(
                                 vpreds=vpreds,
@@ -286,7 +398,9 @@ class DataParallelPPOCritic(BasePPOCritic):
                             raise ValueError(
                                 "critic.value_loss_mode=prompt_baseline_bce requires critic.value_head_type=scalar."
                             )
-                        vpred_logits = vpreds_or_logits
+                        values = model_inputs["values"]
+                        returns = model_inputs["returns"]
+                        vpred_logits = model_output
                         vf_loss, vf_clipfrac, vpreds, categorical_metrics = (
                             core_algos.compute_prompt_baseline_bce_value_loss(
                                 vpred_logits=vpred_logits,
@@ -298,8 +412,10 @@ class DataParallelPPOCritic(BasePPOCritic):
                             )
                         )
                     elif self.value_spec.is_categorical():
+                        values = model_inputs["values"]
+                        returns = model_inputs["returns"]
                         vf_loss, vf_clipfrac, vpreds, categorical_metrics = core_algos.compute_categorical_value_loss(
-                            value_logits=vpreds_or_logits,
+                            value_logits=model_output,
                             values=values,
                             returns=returns,
                             response_mask=response_mask,
@@ -308,7 +424,9 @@ class DataParallelPPOCritic(BasePPOCritic):
                             loss_agg_mode=self.config.loss_agg_mode,
                         )
                     else:
-                        vpreds = vpreds_or_logits
+                        values = model_inputs["values"]
+                        returns = model_inputs["returns"]
+                        vpreds = model_output
                         vf_loss, vf_clipfrac = core_algos.compute_value_loss(
                             vpreds=vpreds,
                             values=values,

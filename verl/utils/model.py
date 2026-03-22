@@ -690,6 +690,10 @@ def _find_value_head_modules(model: nn.Module) -> list[tuple[str, nn.Module]]:
         if isinstance(module, (nn.Linear, StatefulValueHead)):
             value_heads.append((attr_name, module))
 
+    prompt_prior_head = getattr(model, "prompt_prior_head", None)
+    if isinstance(prompt_prior_head, nn.Linear):
+        value_heads.append(("prompt_prior_head", prompt_prior_head))
+
     deduped: list[tuple[str, nn.Module]] = []
     seen_module_ids: set[int] = set()
     for name, module in value_heads:
@@ -699,6 +703,47 @@ def _find_value_head_modules(model: nn.Module) -> list[tuple[str, nn.Module]]:
         seen_module_ids.add(module_id)
         deduped.append((name, module))
     return deduped
+
+
+def _attach_prompt_prior_head(model: nn.Module) -> nn.Module:
+    if getattr(model, "prompt_prior_head", None) is not None:
+        return model
+    if hasattr(model, "v_head"):
+        raise RuntimeError(
+            "Prompt-residual critics require a HuggingFace token-classification critic model. "
+            "TRL AutoModelForCausalLMWithValueHead fallback is not supported."
+        )
+
+    for attr_name in ("score", "classifier"):
+        module = getattr(model, attr_name, None)
+        if isinstance(module, nn.Linear):
+            prompt_prior_head = nn.Linear(module.in_features, 1, bias=module.bias is not None)
+            setattr(model, "prompt_prior_head", prompt_prior_head)
+            return model
+        if isinstance(module, StatefulValueHead):
+            prompt_prior_head = nn.Linear(module.input_size, 1, bias=True)
+            setattr(model, "prompt_prior_head", prompt_prior_head)
+            return model
+
+    raise RuntimeError(
+        "Prompt-residual critics require a token-classification model with a supported scalar head "
+        "(`score`, `classifier`, or a StatefulValueHead replacement)."
+    )
+
+
+def _init_prompt_prior_head_parameters(
+    model: nn.Module,
+    *,
+    mean: float,
+    std: Optional[float],
+    method: str = "normal",
+) -> None:
+    prompt_prior_head = getattr(model, "prompt_prior_head", None)
+    if not isinstance(prompt_prior_head, nn.Linear):
+        return
+    _init_value_head_parameter(prompt_prior_head.weight, method=method, mean=mean, std=std)
+    if prompt_prior_head.bias is not None:
+        _init_value_head_parameter(prompt_prior_head.bias, method=method, mean=mean, std=std)
 
 
 def _init_value_head_parameter(
@@ -782,6 +827,7 @@ def load_valuehead_model(
     value_head_init_mean: float = 0.0,
     value_head_init_std: Optional[float] = None,
     value_head_init_method: Optional[str] = None,
+    use_prompt_residual_value_heads: bool = False,
 ):
     from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
 
@@ -808,12 +854,28 @@ def load_valuehead_model(
             trust_remote_code=trust_remote_code,
         )
         patch_recurrent_value_head(model, head_arch_spec)
-        strict_load = saved_head_arch_spec is not None and saved_head_arch_spec.is_recurrent()
-        _load_hf_checkpoint_weights(model, local_path, strict=strict_load)
-        if (value_head_init_std is not None or value_head_init_method is not None) and not (
+        if use_prompt_residual_value_heads:
+            _attach_prompt_prior_head(model)
+        strict_load = (
+            saved_head_arch_spec is not None
+            and saved_head_arch_spec.is_recurrent()
+            and not use_prompt_residual_value_heads
+        )
+        missing_keys, _ = _load_hf_checkpoint_weights(model, local_path, strict=strict_load)
+        should_init_value_heads = (value_head_init_std is not None or value_head_init_method is not None) and not (
             saved_head_arch_spec is not None and saved_head_arch_spec.is_recurrent()
-        ):
+        )
+        if should_init_value_heads:
             _init_value_head_parameters(
+                model=model,
+                mean=value_head_init_mean,
+                std=value_head_init_std,
+                method=value_head_init_method or "normal",
+            )
+        elif use_prompt_residual_value_heads and any(
+            missing_key.startswith("prompt_prior_head.") for missing_key in missing_keys
+        ):
+            _init_prompt_prior_head_parameters(
                 model=model,
                 mean=value_head_init_mean,
                 std=value_head_init_std,
@@ -821,6 +883,11 @@ def load_valuehead_model(
             )
         return model
     except BaseException as e:
+        if use_prompt_residual_value_heads:
+            raise RuntimeError(
+                "Prompt-residual critics currently require a HuggingFace token-classification model path. "
+                "TRL AutoModelForCausalLMWithValueHead fallback is not supported."
+            ) from e
         if head_arch_spec.is_recurrent():
             raise RuntimeError(
                 "Stateful critic heads currently require a HuggingFace token-classification model path. "

@@ -689,6 +689,8 @@ algorithm:
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
+  prompt_residual_alpha: 1.0
+  prompt_residual_alpha_ramp_steps: 0
   norm_adv_by_std_in_grpo: true
   use_kl_in_reward: false
   kl_penalty: kl
