@@ -305,6 +305,7 @@ class TestZeroCriticMetrics(unittest.TestCase):
             "critic/values/max",
             "critic/values/min",
             "critic/prompt_end_value/mean",
+            "critic/trajectory_end_value/mean",
             "critic/grad_norm",
         }
         self.assertEqual(set(metrics.keys()), expected)
@@ -353,6 +354,7 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertIn("critic/returns/mean", metrics)
         self.assertIn("critic/values/mean", metrics)
         self.assertIn("critic/prompt_end_value/mean", metrics)
+        self.assertIn("critic/trajectory_end_value/mean", metrics)
         self.assertIn("critic/vf_rho", metrics)
         self.assertIn("critic/vf_explained_var", metrics)
         self.assertIn("response_length/mean", metrics)
@@ -362,6 +364,7 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertAlmostEqual(metrics["critic/score/mean"], 5.0)  # Sum of token_level_scores
         self.assertAlmostEqual(metrics["critic/rewards/mean"], 2.5)  # Sum of token_level_rewards
         self.assertAlmostEqual(metrics["critic/prompt_end_value/mean"], 1.0)
+        self.assertAlmostEqual(metrics["critic/trajectory_end_value/mean"], 1.1)
 
         response_mask = self.batch.batch["response_mask"].bool()
         valid_returns = torch.masked_select(self.batch.batch["returns"], response_mask)
@@ -377,6 +380,7 @@ class TestComputeDataMetrics(unittest.TestCase):
         # Check that critic-specific metrics are not present
         self.assertNotIn("critic/values/mean", metrics)
         self.assertNotIn("critic/prompt_end_value/mean", metrics)
+        self.assertNotIn("critic/trajectory_end_value/mean", metrics)
         self.assertNotIn("critic/vf_rho", metrics)
         self.assertNotIn("critic/vf_explained_var", metrics)
 
@@ -447,6 +451,105 @@ class TestComputeDataMetrics(unittest.TestCase):
 
         metrics = compute_data_metrics(batch, use_critic=True)
         self.assertAlmostEqual(metrics["critic/prompt_end_value/mean"], 1.0)
+
+    def test_compute_data_metrics_trajectory_end_value_uses_raw_response_mask_and_logs_return_comparisons(self):
+        batch = MagicMock()
+        batch.batch = {
+            "token_level_scores": torch.tensor([[0.0, 1.0], [0.0, 1.0]], dtype=torch.float32),
+            "token_level_rewards": torch.tensor([[0.0, 1.0], [0.0, 1.0]], dtype=torch.float32),
+            "advantages": torch.zeros((2, 2), dtype=torch.float32),
+            "returns": torch.tensor([[10.0, 10.0], [20.0, 20.0]], dtype=torch.float32),
+            "responses": torch.zeros((2, 2), dtype=torch.float32),
+            "attention_mask": torch.tensor(
+                [
+                    [1, 1, 1, 1],
+                    [1, 1, 1, 1],
+                ]
+            ),
+            # Simulate post-rollout filtering that keeps only the first token for training.
+            "response_mask": torch.tensor(
+                [
+                    [1, 0],
+                    [1, 0],
+                ]
+            ),
+            # The original trajectories both had two response tokens.
+            "raw_response_mask": torch.tensor(
+                [
+                    [1, 1],
+                    [1, 1],
+                ]
+            ),
+            "values": torch.tensor(
+                [
+                    [1.0, 10.0],
+                    [2.0, 20.0],
+                ],
+                dtype=torch.float32,
+            ),
+            "rollout_returns": torch.tensor([10.0, 20.0], dtype=torch.float32),
+        }
+
+        metrics = compute_data_metrics(batch, use_critic=True)
+
+        self.assertAlmostEqual(metrics["critic/prompt_end_value/mean"], 1.5)
+        self.assertAlmostEqual(metrics["critic/trajectory_end_value/mean"], 15.0)
+        self.assertAlmostEqual(metrics["critic/rollout_return/mean"], 15.0)
+        self.assertAlmostEqual(metrics["critic/rollout_return/max"], 20.0)
+        self.assertAlmostEqual(metrics["critic/rollout_return/min"], 10.0)
+        self.assertAlmostEqual(metrics["critic/prompt_end_return_corr"], 1.0)
+        self.assertAlmostEqual(metrics["critic/trajectory_end_return_corr"], 1.0)
+        self.assertAlmostEqual(metrics["critic/prompt_end_vs_return_gap"], 13.5)
+        self.assertAlmostEqual(metrics["critic/trajectory_end_vs_return_gap"], 0.0)
+        self.assertAlmostEqual(metrics["critic/prompt_to_trajectory_value_delta_mean"], 13.5)
+
+    def test_compute_data_metrics_prompt_residual_prompt_end_uses_prompt_prior_head(self):
+        batch = MagicMock()
+        prompt_prior_values = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+        residual_values = torch.tensor(
+            [
+                [10.0, 0.0],
+                [-10.0, 0.0],
+                [10.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+        combined_values = prompt_prior_values.unsqueeze(-1) + residual_values
+        rollout_returns = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+
+        batch.batch = {
+            "token_level_scores": torch.tensor([[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]], dtype=torch.float32),
+            "token_level_rewards": torch.tensor([[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]], dtype=torch.float32),
+            "advantages": torch.zeros((3, 2), dtype=torch.float32),
+            "returns": rollout_returns.unsqueeze(-1).expand(3, 2).clone(),
+            "responses": torch.zeros((3, 2), dtype=torch.float32),
+            "attention_mask": torch.tensor(
+                [
+                    [1, 1, 1, 1],
+                    [1, 1, 1, 1],
+                    [1, 1, 1, 1],
+                ]
+            ),
+            "response_mask": torch.tensor(
+                [
+                    [1, 1],
+                    [1, 1],
+                    [1, 1],
+                ]
+            ),
+            "values": combined_values,
+            "prompt_prior_values": prompt_prior_values,
+            "residual_values": residual_values,
+            "rollout_returns": rollout_returns,
+        }
+
+        metrics = compute_data_metrics(batch, use_critic=True)
+
+        self.assertAlmostEqual(metrics["critic/prompt_end_value/mean"], 2.0)
+        self.assertAlmostEqual(metrics["critic/prompt_prior_mean"], 2.0)
+        self.assertAlmostEqual(metrics["critic/prompt_end_return_corr"], 1.0)
+        self.assertAlmostEqual(metrics["critic/prompt_end_vs_return_gap"], 0.0)
+        self.assertAlmostEqual(metrics["critic/prompt_to_trajectory_value_delta_mean"], 0.0)
 
     def test_compute_data_metrics_logs_prompt_residual_variance_reduction_metrics(self):
         batch = MagicMock()

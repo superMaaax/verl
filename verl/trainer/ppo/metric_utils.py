@@ -131,6 +131,38 @@ def _safe_variance_ratio(
     return ratio.detach().item(), numerator_var.detach().item(), denominator_var.detach().item()
 
 
+def _select_masked_position_values(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    row_mask: torch.Tensor | None = None,
+    position: str = "last",
+) -> torch.Tensor:
+    """Select one scalar per row from the masked response-aligned sequence values."""
+    mask = mask.to(dtype=torch.bool)
+    valid_rows = mask.any(dim=-1)
+    if row_mask is not None:
+        valid_rows = valid_rows & row_mask.to(dtype=torch.bool)
+    if not valid_rows.any():
+        return values.new_empty((0,), dtype=values.dtype)
+
+    masked_values = values[valid_rows]
+    masked_positions = mask[valid_rows]
+    seq_positions = torch.arange(masked_positions.shape[-1], device=values.device).unsqueeze(0).expand_as(masked_positions)
+
+    if position == "first":
+        gather_idx = masked_positions.float().argmax(dim=-1)
+    elif position == "last":
+        gather_idx = torch.where(
+            masked_positions,
+            seq_positions + 1,
+            torch.zeros_like(seq_positions),
+        ).max(dim=-1).values - 1
+    else:
+        raise ValueError(f"Unsupported masked position selector: {position}.")
+
+    return masked_values.gather(1, gather_idx.long().unsqueeze(-1)).squeeze(-1)
+
+
 def _get_non_tensor_batch(batch: DataProto) -> dict[str, Any]:
     non_tensor_batch = getattr(batch, "non_tensor_batch", None)
     return non_tensor_batch if isinstance(non_tensor_batch, dict) else {}
@@ -287,9 +319,14 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             - critic/advantages/mean, max, min: Statistics about advantages
             - critic/returns/mean, max, min: Statistics about returns
             - critic/values/mean, max, min: Statistics about critic values (if use_critic=True)
-            - critic/prompt_end_value/mean: Mean value at the end of prompt (if use_critic=True)
+            - critic/prompt_end_value/mean: Mean value at the end of prompt. For prompt-residual critics,
+              this uses the prompt-prior head alone; otherwise it uses the token-0 value prediction
+              from the main critic output. (if use_critic=True)
+            - critic/trajectory_end_value/mean: Mean of the last response-aligned value on each trajectory
+              (if use_critic=True)
             - critic/vf_rho: Var(returns - values) / Var(returns) on valid response tokens (if use_critic=True)
             - critic/vf_explained_var: Explained variance of the value function (if use_critic=True)
+            - critic/rollout_return/* and prompt/end-vs-return diagnostics when rollout_returns are available
             - response_length/mean, max, min, clip_ratio: Statistics about response lengths
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
             - num_turns/mean, max, min: Statistics about the number of multi-turn conversations
@@ -330,6 +367,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
 
     if use_critic:
         values = batch.batch["values"]
+        prompt_prior_values = batch.batch.get("prompt_prior_values")
         valid_values = torch.masked_select(values, response_mask)
         values_mean, values_max, values_min = _safe_mean_max_min(valid_values)
         if valid_returns.numel() > 1 and valid_values.numel() > 1:
@@ -341,21 +379,57 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             vf_rho = 0.0
             vf_explained_var = 0.0
 
-        # Values are aligned with action positions, so index 0 always corresponds
+        # For prompt-residual critics, report the prompt-prior head alone at prompt end.
+        # Otherwise, values are aligned with action positions, so index 0 corresponds
         # to the value at the last prompt token (before generating token 0).
         # Use valid_training_seq_mask so training diagnostics reflect effective samples only.
-        prompt_end_values = values[valid_training_seq_mask, :1].squeeze(-1)
+        if prompt_prior_values is not None:
+            prompt_end_values = prompt_prior_values[valid_training_seq_mask]
+        else:
+            prompt_end_values = values[valid_training_seq_mask, :1].squeeze(-1)
         prompt_end_value_mean = _mean_or_zero(prompt_end_values)
+        # Use raw_response_mask to recover the final response position even if later
+        # training-time masking trims intermediate or terminal tokens.
+        trajectory_end_values = _select_masked_position_values(
+            values=values,
+            mask=raw_response_mask,
+            row_mask=valid_training_seq_mask,
+            position="last",
+        )
+        trajectory_end_value_mean = _mean_or_zero(trajectory_end_values)
 
         prompt_residual_metrics = {}
-        if "prompt_prior_values" in batch.batch and "rollout_returns" in batch.batch:
-            prompt_prior_values = batch.batch["prompt_prior_values"]
+        if "rollout_returns" in batch.batch:
             rollout_returns = batch.batch["rollout_returns"]
+            valid_rollout_returns = rollout_returns[valid_training_seq_mask]
+            rollout_return_mean, rollout_return_max, rollout_return_min = _safe_mean_max_min(valid_rollout_returns)
+            prompt_residual_metrics.update(
+                {
+                    "critic/rollout_return/mean": rollout_return_mean,
+                    "critic/rollout_return/max": rollout_return_max,
+                    "critic/rollout_return/min": rollout_return_min,
+                    "critic/prompt_end_return_corr": _safe_pearson_corr(prompt_end_values, valid_rollout_returns),
+                    "critic/trajectory_end_return_corr": _safe_pearson_corr(
+                        trajectory_end_values,
+                        valid_rollout_returns,
+                    ),
+                    "critic/prompt_end_vs_return_gap": _mean_or_zero(
+                        torch.abs(prompt_end_values - valid_rollout_returns)
+                    ),
+                    "critic/trajectory_end_vs_return_gap": _mean_or_zero(
+                        torch.abs(trajectory_end_values - valid_rollout_returns)
+                    ),
+                    "critic/prompt_to_trajectory_value_delta_mean": _mean_or_zero(
+                        trajectory_end_values - prompt_end_values
+                    ),
+                }
+            )
+
+        if prompt_prior_values is not None and "rollout_returns" in batch.batch:
             repeated_rollout_returns = rollout_returns.unsqueeze(-1).expand_as(values)
             prompt_ids = non_tensor_batch.get("uid")
 
             valid_prompt_prior = prompt_prior_values[valid_training_seq_mask]
-            valid_rollout_returns = rollout_returns[valid_training_seq_mask]
             valid_prompt_residual = valid_rollout_returns - valid_prompt_prior
             valid_combined_residual = (repeated_rollout_returns - values)[response_mask]
 
@@ -477,6 +551,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
                 "critic/values/min": values_min,
                 # prompt end value (state value before generating first response token)
                 "critic/prompt_end_value/mean": prompt_end_value_mean,
+                # final response-aligned value available on the trajectory
+                "critic/trajectory_end_value/mean": trajectory_end_value_mean,
                 # rho = Var(R - V_hat) / Var(R), using the same valid-token mask as vf_explained_var.
                 "critic/vf_rho": vf_rho,
                 # vf explained var
@@ -720,6 +796,7 @@ def compute_zero_critic_metrics() -> dict[str, float]:
         "critic/values/max": 0.0,
         "critic/values/min": 0.0,
         "critic/prompt_end_value/mean": 0.0,
+        "critic/trajectory_end_value/mean": 0.0,
         "critic/grad_norm": 0.0,
     }
 
