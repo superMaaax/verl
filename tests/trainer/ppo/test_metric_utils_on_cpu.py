@@ -658,15 +658,81 @@ class TestComputeGRPOBaselineMetrics(unittest.TestCase):
         expected_residual_var = residual_var.item()
         expected_reward_var = reward_var.item()
         expected_rho = (residual_var / (reward_var + 1e-5)).item()
+        response_mask = torch.ones_like(batch.batch["token_level_rewards"], dtype=torch.bool)
+        tokenwise_rewards = sequence_rewards.unsqueeze(-1).expand_as(response_mask)[response_mask]
+        tokenwise_residuals = (sequence_rewards - baselines).unsqueeze(-1).expand_as(response_mask)[response_mask]
+        expected_reward_var_tokenwise = torch.var(tokenwise_rewards).item()
+        expected_residual_var_tokenwise = torch.var(tokenwise_residuals).item()
+        expected_rho_tokenwise = (
+            torch.var(tokenwise_residuals) / (torch.var(tokenwise_rewards) + 1e-5)
+        ).item()
 
         self.assertIn("grpo/reward_var", metrics)
         self.assertIn("grpo/residual_var", metrics)
         self.assertIn("grpo/baseline_rho", metrics)
         self.assertIn("grpo/baseline_explained_var", metrics)
+        self.assertIn("grpo/reward_var_tokenwise", metrics)
+        self.assertIn("grpo/residual_var_tokenwise", metrics)
+        self.assertIn("grpo/baseline_rho_tokenwise", metrics)
+        self.assertIn("grpo/baseline_explained_var_tokenwise", metrics)
+        self.assertIn("critic/vf_rho", metrics)
+        self.assertIn("critic/vf_explained_var", metrics)
         self.assertAlmostEqual(metrics["grpo/reward_var"], expected_reward_var)
         self.assertAlmostEqual(metrics["grpo/residual_var"], expected_residual_var)
         self.assertAlmostEqual(metrics["grpo/baseline_rho"], expected_rho)
         self.assertAlmostEqual(metrics["grpo/baseline_explained_var"], 1.0 - expected_rho)
+        self.assertAlmostEqual(metrics["grpo/reward_var_tokenwise"], expected_reward_var_tokenwise)
+        self.assertAlmostEqual(metrics["grpo/residual_var_tokenwise"], expected_residual_var_tokenwise)
+        self.assertAlmostEqual(metrics["grpo/baseline_rho_tokenwise"], expected_rho_tokenwise)
+        self.assertAlmostEqual(metrics["grpo/baseline_explained_var_tokenwise"], 1.0 - expected_rho_tokenwise)
+        self.assertAlmostEqual(metrics["critic/vf_rho"], expected_rho_tokenwise)
+        self.assertAlmostEqual(metrics["critic/vf_explained_var"], 1.0 - expected_rho_tokenwise)
+
+    def test_compute_grpo_baseline_metrics_tokenwise_matches_broadcasted_formula(self):
+        batch = MagicMock()
+        batch.batch = {
+            "token_level_rewards": torch.tensor(
+                [
+                    [1.0, 0.0, 0.0],  # group a -> seq reward 1.0, length 1
+                    [3.0, 0.0, 0.0],  # group a -> seq reward 3.0, length 3
+                    [2.0, 0.0, 0.0],  # singleton group c -> baseline stays 0.0, length 2
+                ]
+            ),
+            "response_mask": torch.tensor(
+                [
+                    [1, 0, 0],
+                    [1, 1, 1],
+                    [1, 1, 0],
+                ]
+            ),
+        }
+        batch.non_tensor_batch = {
+            "uid": np.array(["a", "a", "c"], dtype=object),
+        }
+
+        metrics = compute_grpo_baseline_metrics(batch)
+
+        sequence_rewards = batch.batch["token_level_rewards"].sum(dim=-1)
+        baselines = torch.tensor([2.0, 2.0, 0.0])
+        response_mask = batch.batch["response_mask"].bool()
+        tokenwise_rewards = sequence_rewards.unsqueeze(-1).expand_as(response_mask)[response_mask]
+        tokenwise_residuals = (sequence_rewards - baselines).unsqueeze(-1).expand_as(response_mask)[response_mask]
+        expected_reward_var_tokenwise = torch.var(tokenwise_rewards).item()
+        expected_residual_var_tokenwise = torch.var(tokenwise_residuals).item()
+        expected_rho_tokenwise = (
+            torch.var(tokenwise_residuals) / (torch.var(tokenwise_rewards) + 1e-5)
+        ).item()
+
+        self.assertAlmostEqual(metrics["grpo/reward_var_tokenwise"], expected_reward_var_tokenwise)
+        self.assertAlmostEqual(metrics["grpo/residual_var_tokenwise"], expected_residual_var_tokenwise)
+        self.assertAlmostEqual(metrics["grpo/baseline_rho_tokenwise"], expected_rho_tokenwise)
+        self.assertAlmostEqual(
+            metrics["grpo/baseline_explained_var_tokenwise"],
+            1.0 - expected_rho_tokenwise,
+        )
+        self.assertAlmostEqual(metrics["critic/vf_rho"], expected_rho_tokenwise)
+        self.assertAlmostEqual(metrics["critic/vf_explained_var"], 1.0 - expected_rho_tokenwise)
+        self.assertNotAlmostEqual(metrics["grpo/baseline_rho"], metrics["grpo/baseline_rho_tokenwise"])
 
     def test_compute_grpo_baseline_metrics_returns_empty_without_uid(self):
         batch = MagicMock()
@@ -676,6 +742,24 @@ class TestComputeGRPOBaselineMetrics(unittest.TestCase):
         batch.non_tensor_batch = {}
 
         self.assertEqual(compute_grpo_baseline_metrics(batch), {})
+
+    def test_compute_grpo_baseline_metrics_skips_critic_aliases_when_values_present(self):
+        batch = MagicMock()
+        batch.batch = {
+            "token_level_rewards": torch.tensor([[1.0, 0.0], [3.0, 0.0]]),
+            "response_mask": torch.tensor([[1, 0], [1, 0]]),
+            "values": torch.tensor([[0.5, 0.0], [0.7, 0.0]]),
+        }
+        batch.non_tensor_batch = {
+            "uid": np.array(["a", "a"], dtype=object),
+        }
+
+        metrics = compute_grpo_baseline_metrics(batch)
+
+        self.assertIn("grpo/baseline_rho_tokenwise", metrics)
+        self.assertIn("grpo/baseline_explained_var_tokenwise", metrics)
+        self.assertNotIn("critic/vf_rho", metrics)
+        self.assertNotIn("critic/vf_explained_var", metrics)
 
 
 class TestComputeTimingMetrics(unittest.TestCase):

@@ -657,7 +657,7 @@ def compute_overlong_filtering_metrics(batch: DataProto) -> dict[str, float]:
 
 
 def compute_grpo_baseline_metrics(batch: DataProto) -> dict[str, float]:
-    """Compute GRPO's sequence-level baseline variance reduction metric.
+    """Compute GRPO baseline variance reduction metrics.
 
     This logs the GRPO analogue of critic rho:
 
@@ -666,6 +666,14 @@ def compute_grpo_baseline_metrics(batch: DataProto) -> dict[str, float]:
     where R is the sequence-level reward and b_group is the prompt-group mean
     baseline. To match the current GRPO advantage implementation, singleton
     groups use a zero baseline instead of subtracting their own reward.
+
+    In addition to the sequence-level metric, log tokenwise companions that
+    broadcast the sequence reward and baseline over valid response tokens. The
+    tokenwise version uses the same masked-token weighting style as PPO's
+    ``critic/vf_rho`` and is therefore the better overlay target when comparing
+    GRPO against PPO on the same chart. For cross-run dashboard compatibility,
+    also expose the tokenwise GRPO metric through the ``critic/vf_*`` aliases
+    when no learned critic values are present on the batch.
     """
     non_tensor_batch = _get_non_tensor_batch(batch)
     if "token_level_rewards" not in batch.batch or "uid" not in non_tensor_batch:
@@ -673,7 +681,9 @@ def compute_grpo_baseline_metrics(batch: DataProto) -> dict[str, float]:
 
     response_mask = batch.batch.get("response_mask")
     if response_mask is None:
-        response_mask = torch.ones_like(batch.batch["token_level_rewards"], dtype=torch.float32)
+        response_mask = torch.ones_like(batch.batch["token_level_rewards"], dtype=torch.bool)
+    else:
+        response_mask = response_mask.bool()
     valid_seq_mask = response_mask.sum(dim=-1) > 0
     if valid_seq_mask.sum() <= 1:
         return {}
@@ -694,12 +704,29 @@ def compute_grpo_baseline_metrics(batch: DataProto) -> dict[str, float]:
     reward_var = torch.var(sequence_rewards)
     baseline_rho = residual_var / (reward_var + 1e-5)
 
-    return {
+    valid_response_mask = response_mask[valid_seq_mask]
+    repeated_sequence_rewards = sequence_rewards.unsqueeze(-1).expand_as(valid_response_mask)
+    repeated_baselines = baselines.unsqueeze(-1).expand_as(valid_response_mask)
+    tokenwise_sequence_rewards = repeated_sequence_rewards[valid_response_mask]
+    tokenwise_residuals = (repeated_sequence_rewards - repeated_baselines)[valid_response_mask]
+    tokenwise_residual_var = torch.var(tokenwise_residuals)
+    tokenwise_reward_var = torch.var(tokenwise_sequence_rewards)
+    baseline_rho_tokenwise = tokenwise_residual_var / (tokenwise_reward_var + 1e-5)
+
+    metrics = {
         "grpo/reward_var": reward_var.detach().item(),
         "grpo/residual_var": residual_var.detach().item(),
         "grpo/baseline_rho": baseline_rho.detach().item(),
         "grpo/baseline_explained_var": (1.0 - baseline_rho).detach().item(),
+        "grpo/reward_var_tokenwise": tokenwise_reward_var.detach().item(),
+        "grpo/residual_var_tokenwise": tokenwise_residual_var.detach().item(),
+        "grpo/baseline_rho_tokenwise": baseline_rho_tokenwise.detach().item(),
+        "grpo/baseline_explained_var_tokenwise": (1.0 - baseline_rho_tokenwise).detach().item(),
     }
+    if "values" not in batch.batch:
+        metrics["critic/vf_rho"] = baseline_rho_tokenwise.detach().item()
+        metrics["critic/vf_explained_var"] = (1.0 - baseline_rho_tokenwise).detach().item()
+    return metrics
 
 
 def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> dict[str, Any]:
