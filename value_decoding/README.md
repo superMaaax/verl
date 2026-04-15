@@ -277,6 +277,25 @@ Or use the wrapper script:
 bash /data/shuozhe/verl/value_decoding/script/chunk_guidance_eval.sh
 ```
 
+Run the same chunk-guidance job across a Ray cluster while keeping `--worker_pairs` as the per-node local layout:
+
+```bash
+RAY_ADDRESS="10.0.0.1:6379" \
+python -m value_decoding.chunk_guidance_eval \
+  --actor_checkpoint_dir /data/shuozhe/verl/train_log/job_05b_vh_init_e5_metamath/global_step_800 \
+  --critic_checkpoint_dir /data/shuozhe/verl/train_log/job_policy_gs800_dsk_1d5b_critic/global_step_750 \
+  --dataset_path /data/shuozhe/saved_dataset/MetaMathQA-math-500/test.parquet \
+  --output_dir /data/shuozhe/verl/value_decoding/output/chunk_guidance_eval_ray \
+  --chunk_sizes 32 \
+  --num_chunk_candidates_values 8 \
+  --value_reducers end \
+  --include_critic_only \
+  --worker_pairs cuda:0 \
+  --ray_address auto
+```
+
+If each node has multiple GPUs, keep using the same node-local layout you would use on one machine. For example, `--worker_pairs cuda:0,cuda:1 cuda:2,cuda:3` launches two workers per node, and the Ray path repeats that layout on every alive node before prompt sharding.
+
 Run the offline chunk-ranking benchmark:
 
 ```bash
@@ -344,6 +363,7 @@ WORKER_PAIRS="cuda:0,cuda:1 cuda:2,cuda:3"
 - `--debug_full_candidates` adds candidate ids, log-probs, values, and scores into the step-level log.
 - Multi-GPU support is model-split rather than data-parallel: the actor and critic can run on different devices via `--actor_device` and `--critic_device`.
 - Multi-worker support is explicit via `--worker_pairs` or `WORKER_PAIRS="actor_dev,critic_dev actor_dev,critic_dev ..."`.
+- With `--ray_address`, chunk-guidance workers are scheduled across the alive Ray nodes, and `--worker_pairs` is interpreted as the per-node local layout that should be replicated on each node. The output directory and merged checkpoints therefore need to live on a filesystem shared by all worker nodes.
 
 ## Important Off-Policy Caveat
 

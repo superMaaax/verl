@@ -73,6 +73,8 @@ SEED=42
 SKIP_MERGE=0
 DISABLE_ACTOR_CACHE=0
 DEBUG_FULL_CHUNK_CANDIDATES=0
+RAY_ADDRESS="${RAY_ADDRESS:-}"
+RAY_NUM_CPUS_PER_WORKER="${RAY_NUM_CPUS_PER_WORKER:-1}"
 
 source /data/shuozhe/miniconda3/bin/activate verl
 set -u
@@ -120,6 +122,7 @@ CMD=(
 [[ -n "${COMPARISON_TAIL_H}" ]] && CMD+=(--comparison_tail_h "${COMPARISON_TAIL_H}")
 [[ -n "${COMPARISON_TAIL_EXP_ALPHA}" ]] && CMD+=(--comparison_tail_exp_alpha "${COMPARISON_TAIL_EXP_ALPHA}")
 [[ ${#WORKER_PAIRS_ARR[@]} -gt 0 ]] && CMD+=(--worker_pairs "${WORKER_PAIRS_ARR[@]}")
+[[ -n "${RAY_ADDRESS}" ]] && CMD+=(--ray_address "${RAY_ADDRESS}" --ray_num_cpus_per_worker "${RAY_NUM_CPUS_PER_WORKER}")
 [[ "${SHUFFLE_EXAMPLES}" != "0" ]] && CMD+=(--shuffle_examples)
 [[ "${SKIP_MERGE}" != "0" ]] && CMD+=(--skip_merge)
 [[ "${DISABLE_ACTOR_CACHE}" != "0" ]] && CMD+=(--disable_actor_cache)

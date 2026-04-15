@@ -53,6 +53,8 @@ SEED=42
 SKIP_MERGE=0
 DISABLE_ACTOR_CACHE=0
 DEBUG_FULL_CHUNK_CANDIDATES=0
+RAY_ADDRESS="${RAY_ADDRESS:-}"
+RAY_NUM_CPUS_PER_WORKER="${RAY_NUM_CPUS_PER_WORKER:-1}"
 
 source /data/shuozhe/miniconda3/bin/activate verl
 set -u
@@ -97,6 +99,7 @@ CMD=(
 [[ -n "${ACTOR_DEVICE}" ]] && CMD+=(--actor_device "${ACTOR_DEVICE}")
 [[ -n "${CRITIC_DEVICE}" ]] && CMD+=(--critic_device "${CRITIC_DEVICE}")
 [[ ${#WORKER_PAIRS_ARR[@]} -gt 0 ]] && CMD+=(--worker_pairs "${WORKER_PAIRS_ARR[@]}")
+[[ -n "${RAY_ADDRESS}" ]] && CMD+=(--ray_address "${RAY_ADDRESS}" --ray_num_cpus_per_worker "${RAY_NUM_CPUS_PER_WORKER}")
 [[ "${SHUFFLE_EXAMPLES}" != "0" ]] && CMD+=(--shuffle_examples)
 [[ "${SKIP_MERGE}" != "0" ]] && CMD+=(--skip_merge)
 [[ "${DISABLE_ACTOR_CACHE}" != "0" ]] && CMD+=(--disable_actor_cache)

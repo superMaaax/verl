@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import multiprocessing as mp
+import os
 from queue import Empty
 import re
 import shutil
@@ -19,6 +20,11 @@ from typing import Any, Sequence
 import numpy as np
 import torch
 from tqdm.auto import tqdm
+
+try:
+    import ray
+except ImportError:
+    ray = None
 
 from value_decoding.checkpointing import (
     ensure_merged_component_checkpoint,
@@ -38,7 +44,9 @@ from value_decoding.decoding import (
     set_decode_seed,
 )
 from value_decoding.multi_worker import (
+    RayNodeInfo,
     WorkerAssignment,
+    build_distributed_worker_assignments,
     build_worker_assignments,
     parse_worker_pairs,
     worker_assignments_to_jsonable,
@@ -50,6 +58,8 @@ DEFAULT_NUM_CHUNK_CANDIDATES_VALUES = (2,)
 DEFAULT_BETAS = (0.0, 0.05, 0.1, 0.25)
 STANDARD_TAIL_SUMMARY_LENGTHS = (2, 4, 8, 16)
 DEFAULT_COMPARISON_BOOTSTRAP_SAMPLES = 1_000
+RAY_NODE_RESOURCE_FRACTION = 1e-3
+RAY_PROGRESS_POLL_INTERVAL_SEC = 0.2
 
 
 @dataclass(frozen=True)
@@ -199,6 +209,21 @@ def parse_args() -> argparse.Namespace:
             "Optional prompt-sharded worker layouts. Each entry should be 'actor_device,critic_device' "
             "or a single device to reuse for both."
         ),
+    )
+    parser.add_argument(
+        "--ray_address",
+        type=str,
+        default=None,
+        help=(
+            "Optional Ray cluster address for cross-node execution. When set, --worker_pairs is treated as the "
+            "node-local worker layout and is replicated across all alive Ray nodes. Use 'auto' to read $RAY_ADDRESS."
+        ),
+    )
+    parser.add_argument(
+        "--ray_num_cpus_per_worker",
+        type=float,
+        default=1.0,
+        help="CPU resources reserved per Ray worker task when --ray_address is used.",
     )
     parser.add_argument("--trust_remote_code", action="store_true")
     parser.add_argument("--skip_merge", action="store_true")
@@ -1387,6 +1412,381 @@ def process_example_for_spec(
     )
 
 
+def _validate_visible_cuda_device(device: torch.device | None, *, label: str) -> None:
+    if device is None or device.type != "cuda":
+        return
+    if not torch.cuda.is_available():
+        raise RuntimeError(f"{label} requested CUDA device {device}, but CUDA is not available in this worker.")
+    if device.index is None:
+        return
+    visible_device_count = torch.cuda.device_count()
+    if device.index >= visible_device_count:
+        raise RuntimeError(
+            f"{label} requested CUDA device {device}, but this worker only sees "
+            f"{visible_device_count} CUDA device(s)."
+        )
+
+
+def _emit_progress(*, progress_queue, progress_actor, event: dict[str, Any]) -> None:
+    if progress_queue is not None:
+        progress_queue.put(event)
+        return
+    if progress_actor is not None:
+        progress_actor.put.remote(event)
+
+
+def _resolve_ray_address(ray_address: str | None) -> str | None:
+    if ray_address is None:
+        return None
+    normalized = str(ray_address).strip()
+    if not normalized:
+        return None
+    if normalized.lower() == "auto":
+        env_address = os.environ.get("RAY_ADDRESS")
+        if not env_address:
+            raise ValueError("--ray_address=auto was requested, but $RAY_ADDRESS is not set.")
+        return env_address
+    return normalized
+
+
+def _require_ray():
+    if ray is None:
+        raise ImportError("Ray is required for cross-node chunk guidance evaluation, but it is not installed.")
+    return ray
+
+
+def _unique_preserving_order(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _build_ray_runtime_env(repo_root: Path) -> dict[str, Any]:
+    existing_pythonpath = [entry for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep) if entry]
+    env_vars = {
+        "PYTHONPATH": os.pathsep.join(_unique_preserving_order([str(repo_root), *existing_pythonpath])),
+    }
+    for env_name in (
+        "HF_HOME",
+        "HUGGINGFACE_HUB_CACHE",
+        "PYTHONUNBUFFERED",
+        "TIKTOKEN_ENCODINGS_BASE",
+        "TOKENIZERS_PARALLELISM",
+        "TRANSFORMERS_CACHE",
+        "UV_CACHE_DIR",
+    ):
+        value = os.environ.get(env_name)
+        if value:
+            env_vars[env_name] = value
+    return {"env_vars": env_vars}
+
+
+def _resolve_ray_node_resource_key(node_payload: dict[str, Any]) -> str:
+    resources = node_payload.get("Resources") or {}
+    node_ip = str(node_payload.get("NodeManagerAddress") or "").strip()
+    direct_key = f"node:{node_ip}" if node_ip else None
+    if direct_key is not None and direct_key in resources:
+        return direct_key
+
+    candidates = sorted(str(key) for key in resources if str(key).startswith("node:"))
+    if len(candidates) == 1:
+        return candidates[0]
+
+    if direct_key is not None:
+        matches = [candidate for candidate in candidates if candidate == direct_key or candidate.endswith(node_ip)]
+        if len(matches) == 1:
+            return matches[0]
+
+    node_id = str(node_payload.get("NodeID") or "").strip()
+    if node_id:
+        matches = [candidate for candidate in candidates if node_id in candidate]
+        if len(matches) == 1:
+            return matches[0]
+
+    raise ValueError(
+        "Unable to resolve a unique Ray node resource key for node payload with "
+        f"NodeManagerAddress={node_ip!r} and resources={sorted(str(key) for key in resources)}"
+    )
+
+
+def _discover_ray_nodes(ray_module) -> list[RayNodeInfo]:
+    nodes: list[RayNodeInfo] = []
+    for raw_node in ray_module.nodes():
+        if not bool(raw_node.get("Alive")):
+            continue
+        node_ip = str(raw_node.get("NodeManagerAddress") or "").strip()
+        if not node_ip:
+            raise ValueError(f"Ray reported an alive node without NodeManagerAddress: {raw_node}")
+        nodes.append(
+            RayNodeInfo(
+                node_index=-1,
+                node_ip=node_ip,
+                node_resource_key=_resolve_ray_node_resource_key(raw_node),
+                node_name=(
+                    str(raw_node.get("NodeName"))
+                    if raw_node.get("NodeName") is not None
+                    else (
+                        str(raw_node.get("NodeManagerHostname"))
+                        if raw_node.get("NodeManagerHostname") is not None
+                        else None
+                    )
+                ),
+            )
+        )
+    nodes.sort(key=lambda item: (item.node_ip, item.node_name or ""))
+    return [
+        RayNodeInfo(
+            node_index=index,
+            node_ip=node.node_ip,
+            node_resource_key=node.node_resource_key,
+            node_name=node.node_name,
+        )
+        for index, node in enumerate(nodes)
+    ]
+
+
+class _RayProgressActor:
+    def __init__(self) -> None:
+        self._events: list[dict[str, Any]] = []
+
+    def put(self, event: dict[str, Any]) -> None:
+        self._events.append(dict(event))
+
+    def drain(self) -> list[dict[str, Any]]:
+        events = self._events
+        self._events = []
+        return events
+
+
+def _start_local_worker_processes(
+    *,
+    assignments: Sequence[WorkerAssignment],
+    actor_hf_dir: Path,
+    critic_hf_dir: Path | None,
+    examples: list[ExampleRecord],
+    run_specs: list[ChunkRunSpec],
+    dtype_name: str,
+    trust_remote_code: bool,
+    max_prompt_length: int,
+    max_new_tokens: int,
+    eos_token_ids: tuple[int, ...],
+    normalization_eps: float,
+    use_actor_cache: bool,
+    debug_full_chunk_candidates: bool,
+    seed: int,
+    worker_root: Path,
+) -> tuple[Any, list[tuple[mp.Process, WorkerAssignment]]]:
+    context = mp.get_context("spawn")
+    progress_queue = context.Queue()
+    processes: list[tuple[mp.Process, WorkerAssignment]] = []
+    for assignment in assignments:
+        process = context.Process(
+            target=_worker_entry,
+            kwargs={
+                "assignment": assignment,
+                "actor_hf_dir": str(actor_hf_dir),
+                "critic_hf_dir": None if critic_hf_dir is None else str(critic_hf_dir),
+                "examples": examples,
+                "run_specs": run_specs,
+                "dtype_name": dtype_name,
+                "trust_remote_code": trust_remote_code,
+                "max_prompt_length": max_prompt_length,
+                "max_new_tokens": max_new_tokens,
+                "eos_token_ids": eos_token_ids,
+                "normalization_eps": normalization_eps,
+                "use_actor_cache": use_actor_cache,
+                "debug_full_chunk_candidates": debug_full_chunk_candidates,
+                "seed": seed,
+                "worker_root": str(worker_root),
+                "progress_queue": progress_queue,
+            },
+            name=f"chunk_guidance_worker_{assignment.worker_id}",
+        )
+        process.start()
+        processes.append((process, assignment))
+    return progress_queue, processes
+
+
+def _assert_local_processes_healthy(
+    *,
+    processes: Sequence[tuple[mp.Process, WorkerAssignment]],
+    worker_root: Path,
+) -> None:
+    for process, assignment in processes:
+        if process.exitcode not in (None, 0):
+            error_path = worker_root / f"worker_{assignment.worker_id:03d}" / "worker_error.txt"
+            if error_path.exists():
+                raise RuntimeError(
+                    f"Worker {assignment.worker_id} failed with exit code {process.exitcode}.\n"
+                    f"{error_path.read_text(encoding='utf-8')}"
+                )
+            raise RuntimeError(f"Worker {assignment.worker_id} failed with exit code {process.exitcode}.")
+
+
+def _join_local_processes(
+    *,
+    processes: Sequence[tuple[mp.Process, WorkerAssignment]],
+    worker_root: Path,
+) -> None:
+    for process, assignment in processes:
+        process.join()
+        if process.exitcode != 0:
+            error_path = worker_root / f"worker_{assignment.worker_id:03d}" / "worker_error.txt"
+            if error_path.exists():
+                raise RuntimeError(
+                    f"Worker {assignment.worker_id} failed with exit code {process.exitcode}.\n"
+                    f"{error_path.read_text(encoding='utf-8')}"
+                )
+            raise RuntimeError(f"Worker {assignment.worker_id} failed with exit code {process.exitcode}.")
+
+
+def _normalize_cuda_device_name(device_name: str | None, *, assume_default_cuda: bool) -> str | None:
+    if device_name is None:
+        return "cuda:0" if assume_default_cuda else None
+    resolved = torch.device(device_name)
+    if resolved.type != "cuda":
+        return str(resolved)
+    resolved_index = 0 if resolved.index is None else int(resolved.index)
+    return f"cuda:{resolved_index}"
+
+
+def _remap_cuda_device_name(device_name: str | None, *, cuda_slot_mapping: dict[int, int]) -> str | None:
+    if device_name is None:
+        return None
+    resolved = torch.device(device_name)
+    if resolved.type != "cuda":
+        return str(resolved)
+    resolved_index = 0 if resolved.index is None else int(resolved.index)
+    if resolved_index not in cuda_slot_mapping:
+        raise ValueError(
+            f"CUDA device index {resolved_index} is missing from the Ray-visible slot mapping {cuda_slot_mapping}."
+        )
+    return f"cuda:{cuda_slot_mapping[resolved_index]}"
+
+
+def _build_ray_node_execution_specs(
+    *,
+    worker_assignments: Sequence[WorkerAssignment],
+    critic_enabled: bool,
+    ray_num_cpus_per_worker: float,
+) -> list[dict[str, Any]]:
+    node_groups: dict[tuple[int | None, str | None, str | None], list[WorkerAssignment]] = {}
+    for assignment in worker_assignments:
+        group_key = (assignment.node_index, assignment.node_ip, assignment.node_resource_key)
+        node_groups.setdefault(group_key, []).append(assignment)
+
+    node_specs: list[dict[str, Any]] = []
+    for group_key in sorted(node_groups, key=lambda item: (-1 if item[0] is None else int(item[0]), str(item[1]))):
+        node_assignments = sorted(node_groups[group_key], key=lambda item: int(item.worker_id))
+        normalized_assignments: list[tuple[WorkerAssignment, str | None, str | None]] = []
+        referenced_cuda_slots: set[int] = set()
+
+        for assignment in node_assignments:
+            actor_device_name = _normalize_cuda_device_name(
+                assignment.actor_device,
+                assume_default_cuda=True,
+            )
+            critic_device_name = (
+                _normalize_cuda_device_name(
+                    assignment.critic_device if assignment.critic_device is not None else actor_device_name,
+                    assume_default_cuda=True,
+                )
+                if critic_enabled
+                else None
+            )
+            normalized_assignments.append((assignment, actor_device_name, critic_device_name))
+            for device_name in (actor_device_name, critic_device_name):
+                if device_name is None:
+                    continue
+                resolved = torch.device(device_name)
+                if resolved.type == "cuda":
+                    referenced_cuda_slots.add(0 if resolved.index is None else int(resolved.index))
+
+        cuda_slot_mapping = {
+            original_slot: remapped_slot
+            for remapped_slot, original_slot in enumerate(sorted(referenced_cuda_slots))
+        }
+        remapped_assignments: list[WorkerAssignment] = []
+        for assignment, actor_device_name, critic_device_name in normalized_assignments:
+            remapped_assignments.append(
+                WorkerAssignment(
+                    worker_id=assignment.worker_id,
+                    actor_device=_remap_cuda_device_name(actor_device_name, cuda_slot_mapping=cuda_slot_mapping),
+                    critic_device=_remap_cuda_device_name(critic_device_name, cuda_slot_mapping=cuda_slot_mapping),
+                    example_start=assignment.example_start,
+                    example_end=assignment.example_end,
+                    node_index=assignment.node_index,
+                    node_ip=assignment.node_ip,
+                    node_resource_key=assignment.node_resource_key,
+                    local_worker_index=assignment.local_worker_index,
+                )
+            )
+
+        node_specs.append(
+            {
+                "node_index": group_key[0],
+                "node_ip": group_key[1],
+                "node_resource_key": group_key[2],
+                "assignments": remapped_assignments,
+                "num_gpus": float(len(referenced_cuda_slots)),
+                "num_cpus": float(ray_num_cpus_per_worker) * float(len(remapped_assignments)),
+                "cuda_slot_mapping": cuda_slot_mapping,
+            }
+        )
+    return node_specs
+
+
+def _ray_node_entry_remote(**kwargs) -> dict[str, Any]:
+    assignments: list[WorkerAssignment] = kwargs["assignments"]
+    progress_actor = kwargs["progress_actor"]
+    progress_queue, processes = _start_local_worker_processes(
+        assignments=assignments,
+        actor_hf_dir=Path(kwargs["actor_hf_dir"]),
+        critic_hf_dir=None if kwargs["critic_hf_dir"] is None else Path(kwargs["critic_hf_dir"]),
+        examples=kwargs["examples"],
+        run_specs=kwargs["run_specs"],
+        dtype_name=kwargs["dtype_name"],
+        trust_remote_code=kwargs["trust_remote_code"],
+        max_prompt_length=kwargs["max_prompt_length"],
+        max_new_tokens=kwargs["max_new_tokens"],
+        eos_token_ids=kwargs["eos_token_ids"],
+        normalization_eps=kwargs["normalization_eps"],
+        use_actor_cache=kwargs["use_actor_cache"],
+        debug_full_chunk_candidates=kwargs["debug_full_chunk_candidates"],
+        seed=kwargs["seed"],
+        worker_root=Path(kwargs["worker_root"]),
+    )
+    worker_root = Path(kwargs["worker_root"])
+    completed_workers = 0
+    while completed_workers < len(assignments):
+        try:
+            event = progress_queue.get(timeout=RAY_PROGRESS_POLL_INTERVAL_SEC)
+        except Empty:
+            _assert_local_processes_healthy(processes=processes, worker_root=worker_root)
+            continue
+
+        progress_actor.put.remote(event)
+        if event.get("type") == "worker_done":
+            completed_workers += 1
+        elif event.get("type") == "worker_error":
+            raise RuntimeError(
+                f"Worker {event.get('worker_id')} reported an error.\n"
+                f"{event.get('traceback', 'No traceback provided.')}"
+            )
+
+    _join_local_processes(processes=processes, worker_root=worker_root)
+    return {
+        "node_index": kwargs["node_index"],
+        "node_ip": kwargs["node_ip"],
+        "worker_ids": [int(assignment.worker_id) for assignment in assignments],
+    }
+
+
 def _progress_postfix(worker_progress: dict[int, dict[str, Any]]) -> str:
     parts: list[str] = []
     for worker_id in sorted(worker_progress):
@@ -1418,7 +1818,8 @@ def _worker_entry(
     debug_full_chunk_candidates: bool,
     seed: int,
     worker_root: str,
-    progress_queue,
+    progress_queue=None,
+    progress_actor=None,
 ) -> None:
     worker_dir = Path(worker_root) / f"worker_{assignment.worker_id:03d}"
     worker_dir.mkdir(parents=True, exist_ok=True)
@@ -1428,11 +1829,13 @@ def _worker_entry(
     try:
         start_time = time.perf_counter()
         actor_device = resolve_device(assignment.actor_device)
+        _validate_visible_cuda_device(actor_device, label="actor_device")
         critic_device = (
             resolve_device(assignment.critic_device)
             if critic_hf_dir is not None and assignment.critic_device
             else None
         )
+        _validate_visible_cuda_device(critic_device, label="critic_device")
         dtype = resolve_dtype(dtype_name)
 
         tokenizer = load_tokenizer(Path(actor_hf_dir), trust_remote_code=trust_remote_code)
@@ -1456,14 +1859,15 @@ def _worker_entry(
         local_examples = examples[assignment.example_start : assignment.example_end]
         worker_total_tasks = len(local_examples) * len(run_specs)
         worker_completed_tasks = 0
-        if progress_queue is not None:
-            progress_queue.put(
-                {
-                    "type": "worker_started",
-                    "worker_id": assignment.worker_id,
-                    "worker_total_tasks": worker_total_tasks,
-                }
-            )
+        _emit_progress(
+            progress_queue=progress_queue,
+            progress_actor=progress_actor,
+            event={
+                "type": "worker_started",
+                "worker_id": assignment.worker_id,
+                "worker_total_tasks": worker_total_tasks,
+            },
+        )
 
         per_config_counts: dict[str, int] = {}
         per_config_start_wall_time_sec: dict[str, float] = {}
@@ -1502,16 +1906,17 @@ def _worker_entry(
                         chunk_decision_file.write(_json_line(chunk_decision_result))
                     count += 1
                     worker_completed_tasks += 1
-                    if progress_queue is not None:
-                        progress_queue.put(
-                            {
-                                "type": "task_done",
-                                "worker_id": assignment.worker_id,
-                                "config_id": spec.config_id,
-                                "worker_completed_tasks": worker_completed_tasks,
-                                "worker_total_tasks": worker_total_tasks,
-                            }
-                        )
+                    _emit_progress(
+                        progress_queue=progress_queue,
+                        progress_actor=progress_actor,
+                        event={
+                            "type": "task_done",
+                            "worker_id": assignment.worker_id,
+                            "config_id": spec.config_id,
+                            "worker_completed_tasks": worker_completed_tasks,
+                            "worker_total_tasks": worker_total_tasks,
+                        },
+                    )
 
             per_config_counts[spec.config_id] = count
             per_config_start_wall_time_sec[spec.config_id] = config_start_wall
@@ -1522,6 +1927,10 @@ def _worker_entry(
             "worker_id": assignment.worker_id,
             "actor_device": str(actor_device),
             "critic_device": None if critic_device is None else str(critic_device),
+            "node_index": assignment.node_index,
+            "node_ip": assignment.node_ip,
+            "node_resource_key": assignment.node_resource_key,
+            "local_worker_index": assignment.local_worker_index,
             "example_start": assignment.example_start,
             "example_end": assignment.example_end,
             "num_examples": assignment.num_examples,
@@ -1534,25 +1943,27 @@ def _worker_entry(
         }
         with summary_path.open("w", encoding="utf-8") as summary_file:
             json.dump(summary_payload, summary_file, ensure_ascii=True, indent=2)
-        if progress_queue is not None:
-            progress_queue.put(
-                {
-                    "type": "worker_done",
-                    "worker_id": assignment.worker_id,
-                    "worker_completed_tasks": worker_completed_tasks,
-                    "worker_total_tasks": worker_total_tasks,
-                }
-            )
+        _emit_progress(
+            progress_queue=progress_queue,
+            progress_actor=progress_actor,
+            event={
+                "type": "worker_done",
+                "worker_id": assignment.worker_id,
+                "worker_completed_tasks": worker_completed_tasks,
+                "worker_total_tasks": worker_total_tasks,
+            },
+        )
     except Exception:
         error_path.write_text(traceback.format_exc(), encoding="utf-8")
-        if progress_queue is not None:
-            progress_queue.put(
-                {
-                    "type": "worker_error",
-                    "worker_id": assignment.worker_id,
-                    "traceback": traceback.format_exc(),
-                }
-            )
+        _emit_progress(
+            progress_queue=progress_queue,
+            progress_actor=progress_actor,
+            event={
+                "type": "worker_error",
+                "worker_id": assignment.worker_id,
+                "traceback": traceback.format_exc(),
+            },
+        )
         raise
 
 
@@ -1582,34 +1993,23 @@ def run_multi_worker(
     shutil.rmtree(worker_root, ignore_errors=True)
     worker_root.mkdir(parents=True, exist_ok=True)
 
-    context = mp.get_context("spawn")
-    progress_queue = context.Queue()
-    processes: list[tuple[mp.Process, WorkerAssignment]] = []
-    for assignment in assignments:
-        process = context.Process(
-            target=_worker_entry,
-            kwargs={
-                "assignment": assignment,
-                "actor_hf_dir": str(actor_hf_dir),
-                "critic_hf_dir": None if critic_hf_dir is None else str(critic_hf_dir),
-                "examples": examples,
-                "run_specs": run_specs,
-                "dtype_name": dtype_name,
-                "trust_remote_code": trust_remote_code,
-                "max_prompt_length": max_prompt_length,
-                "max_new_tokens": max_new_tokens,
-                "eos_token_ids": eos_token_ids,
-                "normalization_eps": normalization_eps,
-                "use_actor_cache": use_actor_cache,
-                "debug_full_chunk_candidates": debug_full_chunk_candidates,
-                "seed": seed,
-                "worker_root": str(worker_root),
-                "progress_queue": progress_queue,
-            },
-            name=f"chunk_guidance_worker_{assignment.worker_id}",
-        )
-        process.start()
-        processes.append((process, assignment))
+    progress_queue, processes = _start_local_worker_processes(
+        assignments=assignments,
+        actor_hf_dir=actor_hf_dir,
+        critic_hf_dir=critic_hf_dir,
+        examples=examples,
+        run_specs=run_specs,
+        dtype_name=dtype_name,
+        trust_remote_code=trust_remote_code,
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=max_new_tokens,
+        eos_token_ids=eos_token_ids,
+        normalization_eps=normalization_eps,
+        use_actor_cache=use_actor_cache,
+        debug_full_chunk_candidates=debug_full_chunk_candidates,
+        seed=seed,
+        worker_root=worker_root,
+    )
 
     total_tasks = len(examples) * len(run_specs)
     completed_tasks = 0
@@ -1629,15 +2029,7 @@ def run_multi_worker(
             try:
                 event = progress_queue.get(timeout=0.2)
             except Empty:
-                for process, assignment in processes:
-                    if process.exitcode not in (None, 0):
-                        error_path = worker_root / f"worker_{assignment.worker_id:03d}" / "worker_error.txt"
-                        if error_path.exists():
-                            raise RuntimeError(
-                                f"Worker {assignment.worker_id} failed with exit code {process.exitcode}.\n"
-                                f"{error_path.read_text(encoding='utf-8')}"
-                            )
-                        raise RuntimeError(f"Worker {assignment.worker_id} failed with exit code {process.exitcode}.")
+                _assert_local_processes_healthy(processes=processes, worker_root=worker_root)
                 continue
 
             event_type = event.get("type")
@@ -1664,17 +2056,23 @@ def run_multi_worker(
                 )
             progress_bar.set_postfix_str(_progress_postfix(worker_progress))
 
-    for process, assignment in processes:
-        process.join()
-        if process.exitcode != 0:
-            error_path = worker_root / f"worker_{assignment.worker_id:03d}" / "worker_error.txt"
-            if error_path.exists():
-                raise RuntimeError(
-                    f"Worker {assignment.worker_id} failed with exit code {process.exitcode}.\n"
-                    f"{error_path.read_text(encoding='utf-8')}"
-                )
-            raise RuntimeError(f"Worker {assignment.worker_id} failed with exit code {process.exitcode}.")
+    _join_local_processes(processes=processes, worker_root=worker_root)
 
+    return _collect_worker_outputs(
+        output_dir=output_dir,
+        worker_root=worker_root,
+        assignments=assignments,
+        run_specs=run_specs,
+    )
+
+
+def _collect_worker_outputs(
+    *,
+    output_dir: Path,
+    worker_root: Path,
+    assignments: Sequence[WorkerAssignment],
+    run_specs: Sequence[ChunkRunSpec],
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
     per_example_path = output_dir / "per_example_results.jsonl"
     chunk_decision_path = output_dir / "chunk_decision_results.jsonl"
     example_results_by_config: dict[str, list[dict[str, Any]]] = {spec.config_id: [] for spec in run_specs}
@@ -1706,6 +2104,169 @@ def run_multi_worker(
             worker_summaries.append(json.load(summary_file))
     worker_summaries.sort(key=lambda item: int(item["worker_id"]))
     return example_results_by_config, worker_summaries
+
+
+def run_ray_multi_worker(
+    *,
+    output_dir: Path,
+    actor_hf_dir: Path,
+    critic_hf_dir: Path | None,
+    examples: list[ExampleRecord],
+    run_specs: list[ChunkRunSpec],
+    worker_assignments: list[WorkerAssignment],
+    dtype_name: str,
+    trust_remote_code: bool,
+    max_prompt_length: int,
+    max_new_tokens: int,
+    eos_token_ids: tuple[int, ...],
+    normalization_eps: float,
+    use_actor_cache: bool,
+    debug_full_chunk_candidates: bool,
+    seed: int,
+    ray_num_cpus_per_worker: float,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    if not worker_assignments:
+        raise ValueError("No worker assignments were created.")
+    if ray_num_cpus_per_worker <= 0:
+        raise ValueError(f"ray_num_cpus_per_worker must be > 0, got {ray_num_cpus_per_worker}.")
+
+    ray_module = _require_ray()
+    if not ray_module.is_initialized():
+        raise RuntimeError("Ray must be initialized before running cross-node chunk guidance workers.")
+
+    worker_root = output_dir / "_worker_tmp"
+    shutil.rmtree(worker_root, ignore_errors=True)
+    worker_root.mkdir(parents=True, exist_ok=True)
+
+    progress_actor = ray_module.remote(num_cpus=0)(_RayProgressActor).remote()
+    node_execution_specs = _build_ray_node_execution_specs(
+        worker_assignments=worker_assignments,
+        critic_enabled=critic_hf_dir is not None,
+        ray_num_cpus_per_worker=ray_num_cpus_per_worker,
+    )
+    node_remote = ray_module.remote(max_retries=0)(_ray_node_entry_remote)
+
+    node_refs = []
+    ref_to_node_spec: dict[Any, dict[str, Any]] = {}
+    for node_spec in node_execution_specs:
+        node_resource_key = node_spec["node_resource_key"]
+        if node_resource_key is None:
+            raise ValueError(
+                f"Ray node execution spec for node {node_spec['node_ip']} is missing node_resource_key."
+            )
+        node_ref = node_remote.options(
+            num_cpus=float(node_spec["num_cpus"]),
+            num_gpus=float(node_spec["num_gpus"]),
+            resources={node_resource_key: RAY_NODE_RESOURCE_FRACTION},
+        ).remote(
+            node_index=node_spec["node_index"],
+            node_ip=node_spec["node_ip"],
+            assignments=node_spec["assignments"],
+            actor_hf_dir=str(actor_hf_dir),
+            critic_hf_dir=None if critic_hf_dir is None else str(critic_hf_dir),
+            examples=examples,
+            run_specs=run_specs,
+            dtype_name=dtype_name,
+            trust_remote_code=trust_remote_code,
+            max_prompt_length=max_prompt_length,
+            max_new_tokens=max_new_tokens,
+            eos_token_ids=eos_token_ids,
+            normalization_eps=normalization_eps,
+            use_actor_cache=use_actor_cache,
+            debug_full_chunk_candidates=debug_full_chunk_candidates,
+            seed=seed,
+            worker_root=str(worker_root),
+            progress_actor=progress_actor,
+        )
+        node_refs.append(node_ref)
+        ref_to_node_spec[node_ref] = node_spec
+
+    total_tasks = len(examples) * len(run_specs)
+    completed_tasks = 0
+    completed_workers = 0
+    worker_progress: dict[int, dict[str, Any]] = {
+        assignment.worker_id: {
+            "done": 0,
+            "total": assignment.num_examples * len(run_specs),
+            "config_id": None,
+        }
+        for assignment in worker_assignments
+    }
+
+    pending_refs = list(node_refs)
+    with tqdm(total=total_tasks, desc="chunk_guidance_eval", unit="task", dynamic_ncols=True) as progress_bar:
+        progress_bar.set_postfix_str(_progress_postfix(worker_progress))
+        while completed_tasks < total_tasks or completed_workers < len(worker_assignments):
+            events = ray_module.get(progress_actor.drain.remote())
+            for event in events:
+                event_type = event.get("type")
+                worker_id = int(event.get("worker_id", -1))
+                if event_type == "worker_started":
+                    worker_progress.setdefault(worker_id, {})
+                    worker_progress[worker_id]["total"] = int(event.get("worker_total_tasks", 0))
+                elif event_type == "task_done":
+                    completed_tasks += 1
+                    worker_progress.setdefault(worker_id, {})
+                    worker_progress[worker_id]["done"] = int(event.get("worker_completed_tasks", 0))
+                    worker_progress[worker_id]["total"] = int(event.get("worker_total_tasks", 0))
+                    worker_progress[worker_id]["config_id"] = str(event.get("config_id"))
+                    progress_bar.update(1)
+                elif event_type == "worker_done":
+                    completed_workers += 1
+                    worker_progress.setdefault(worker_id, {})
+                    worker_progress[worker_id]["done"] = int(event.get("worker_completed_tasks", 0))
+                    worker_progress[worker_id]["total"] = int(event.get("worker_total_tasks", 0))
+                    worker_progress[worker_id]["config_id"] = "done"
+                elif event_type == "worker_error":
+                    raise RuntimeError(
+                        f"Worker {worker_id} reported an error.\n{event.get('traceback', 'No traceback provided.')}"
+                    )
+                progress_bar.set_postfix_str(_progress_postfix(worker_progress))
+
+            if pending_refs:
+                done_refs, pending_refs = ray_module.wait(
+                    pending_refs,
+                    num_returns=1,
+                    timeout=RAY_PROGRESS_POLL_INTERVAL_SEC,
+                )
+                for done_ref in done_refs:
+                    node_spec = ref_to_node_spec[done_ref]
+                    try:
+                        ray_module.get(done_ref)
+                    except Exception as exc:
+                        for assignment in node_spec["assignments"]:
+                            error_path = worker_root / f"worker_{assignment.worker_id:03d}" / "worker_error.txt"
+                            if error_path.exists():
+                                raise RuntimeError(
+                                    f"Worker {assignment.worker_id} failed on Ray node {assignment.node_ip}.\n"
+                                    f"{error_path.read_text(encoding='utf-8')}"
+                                ) from exc
+                        raise RuntimeError(
+                            f"Ray node task failed on node {node_spec['node_ip']} "
+                            f"for workers {[assignment.worker_id for assignment in node_spec['assignments']]}."
+                        ) from exc
+            else:
+                time.sleep(RAY_PROGRESS_POLL_INTERVAL_SEC)
+
+    if node_refs:
+        try:
+            ray_module.get(node_refs)
+        except Exception:
+            for assignment in worker_assignments:
+                error_path = worker_root / f"worker_{assignment.worker_id:03d}" / "worker_error.txt"
+                if error_path.exists():
+                    raise RuntimeError(
+                        f"Worker {assignment.worker_id} failed on Ray node {assignment.node_ip}.\n"
+                        f"{error_path.read_text(encoding='utf-8')}"
+                    )
+            raise
+
+    return _collect_worker_outputs(
+        output_dir=output_dir,
+        worker_root=worker_root,
+        assignments=worker_assignments,
+        run_specs=run_specs,
+    )
 
 
 def aggregate_results(
@@ -2217,6 +2778,8 @@ def _write_output_readme(
         "",
         "## Run Config",
         f"- Dataset: `{args.dataset_path}`",
+        f"- Execution backend: `{'ray' if _resolve_ray_address(args.ray_address) is not None else 'local'}`",
+        f"- Ray address: `{_resolve_ray_address(args.ray_address)}`",
         f"- Chunk sizes: `{args.chunk_sizes}`",
         f"- Candidate counts: `{args.num_chunk_candidates_values}`",
         f"- Betas: `{args.betas}`",
@@ -2281,6 +2844,8 @@ def main() -> int:
             "comparison_tail_exp_alpha must be strictly between 0 and 1, "
             f"got {args.comparison_tail_exp_alpha}"
         )
+    if args.ray_num_cpus_per_worker <= 0:
+        raise ValueError(f"ray_num_cpus_per_worker must be > 0, got {args.ray_num_cpus_per_worker}")
 
     repo_root = Path(__file__).resolve().parent.parent
     output_dir = Path(args.output_dir).resolve()
@@ -2334,16 +2899,66 @@ def main() -> int:
         )
     )
 
+    ray_address = _resolve_ray_address(args.ray_address)
+    execution_backend = "ray" if ray_address is not None else "local"
     worker_pairs = parse_worker_pairs(
         args.worker_pairs,
         actor_device=args.actor_device,
         critic_device=args.critic_device,
         default_device=args.device,
     )
-    worker_assignments = build_worker_assignments(num_examples=len(examples), worker_pairs=worker_pairs)
+    ray_nodes: list[RayNodeInfo] = []
+    if ray_address is not None:
+        ray_module = _require_ray()
+        if not ray_module.is_initialized():
+            ray_module.init(address=ray_address, runtime_env=_build_ray_runtime_env(repo_root))
+        ray_nodes = _discover_ray_nodes(ray_module)
+        if not ray_nodes:
+            raise ValueError("Ray is connected, but no alive Ray nodes were discovered.")
+        worker_assignments = build_distributed_worker_assignments(
+            num_examples=len(examples),
+            worker_pairs=worker_pairs,
+            ray_nodes=ray_nodes,
+        )
+    else:
+        worker_assignments = build_worker_assignments(num_examples=len(examples), worker_pairs=worker_pairs)
     multi_worker_enabled = len(worker_assignments) > 1
 
-    if multi_worker_enabled:
+    if ray_address is not None:
+        example_results_by_config, worker_summaries = run_ray_multi_worker(
+            output_dir=output_dir,
+            actor_hf_dir=actor_hf_dir,
+            critic_hf_dir=critic_hf_dir,
+            examples=examples,
+            run_specs=run_specs,
+            worker_assignments=worker_assignments,
+            dtype_name=args.dtype,
+            trust_remote_code=args.trust_remote_code,
+            max_prompt_length=args.max_prompt_length,
+            max_new_tokens=args.max_new_tokens,
+            eos_token_ids=eos_token_ids,
+            normalization_eps=args.normalization_eps,
+            use_actor_cache=not args.disable_actor_cache,
+            debug_full_chunk_candidates=args.debug_full_chunk_candidates,
+            seed=args.seed,
+            ray_num_cpus_per_worker=args.ray_num_cpus_per_worker,
+        )
+        actor_device = None
+        critic_device = None
+        per_config_wall_times: dict[str, float] = {}
+        for spec in run_specs:
+            start_times = []
+            end_times = []
+            for summary in worker_summaries:
+                start_time_sec = summary.get("per_config_start_wall_time_sec", {}).get(spec.config_id)
+                end_time_sec = summary.get("per_config_end_wall_time_sec", {}).get(spec.config_id)
+                if start_time_sec is not None and end_time_sec is not None:
+                    start_times.append(float(start_time_sec))
+                    end_times.append(float(end_time_sec))
+            per_config_wall_times[spec.config_id] = (
+                (max(end_times) - min(start_times)) if start_times and end_times else 0.0
+            )
+    elif multi_worker_enabled:
         example_results_by_config, worker_summaries = run_multi_worker(
             output_dir=output_dir,
             actor_hf_dir=actor_hf_dir,
@@ -2538,6 +3153,7 @@ def main() -> int:
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "repo_root": str(repo_root),
         "git_commit": _git_commit(repo_root),
+        "execution_backend": execution_backend,
         "actor_checkpoint_dir": str(actor_checkpoint_dir),
         "critic_checkpoint_dir": str(critic_checkpoint_dir),
         "merged_actor_dir": str(actor_hf_dir),
@@ -2548,6 +3164,8 @@ def main() -> int:
         "multi_worker_enabled": multi_worker_enabled,
         "actor_device": None if actor_device is None else str(actor_device),
         "critic_device": None if critic_device is None else str(critic_device),
+        "ray_address": ray_address,
+        "ray_nodes": [asdict(node) for node in ray_nodes],
         "worker_pairs": [[actor, critic] for actor, critic in worker_pairs],
         "worker_assignments": worker_assignments_to_jsonable(worker_assignments),
         "worker_summaries": worker_summaries,

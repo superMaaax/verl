@@ -30,10 +30,22 @@ class WorkerAssignment:
     critic_device: str | None
     example_start: int
     example_end: int
+    node_index: int | None = None
+    node_ip: str | None = None
+    node_resource_key: str | None = None
+    local_worker_index: int | None = None
 
     @property
     def num_examples(self) -> int:
         return max(self.example_end - self.example_start, 0)
+
+
+@dataclass(frozen=True)
+class RayNodeInfo:
+    node_index: int
+    node_ip: str
+    node_resource_key: str
+    node_name: str | None = None
 
 
 def parse_worker_pairs(
@@ -66,6 +78,26 @@ def parse_worker_pairs(
     return [(resolved_actor, resolved_critic)]
 
 
+def _assignment_ranges(*, num_examples: int, num_workers: int) -> list[tuple[int, int]]:
+    if num_examples <= 0:
+        return []
+    if num_workers <= 0:
+        raise ValueError("num_workers must be > 0 when examples are present.")
+
+    active_workers = min(num_workers, num_examples)
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    base = num_examples // active_workers
+    remainder = num_examples % active_workers
+
+    for worker_id in range(active_workers):
+        shard_size = base + (1 if worker_id < remainder else 0)
+        end = start + shard_size
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
 def build_worker_assignments(
     *,
     num_examples: int,
@@ -76,15 +108,10 @@ def build_worker_assignments(
     if num_examples <= 0:
         return []
 
-    active_workers = min(len(worker_pairs), num_examples)
     assignments: list[WorkerAssignment] = []
-    start = 0
-    base = num_examples // active_workers
-    remainder = num_examples % active_workers
+    ranges = _assignment_ranges(num_examples=num_examples, num_workers=len(worker_pairs))
 
-    for worker_id in range(active_workers):
-        shard_size = base + (1 if worker_id < remainder else 0)
-        end = start + shard_size
+    for worker_id, (start, end) in enumerate(ranges):
         actor_dev, critic_dev = worker_pairs[worker_id]
         assignments.append(
             WorkerAssignment(
@@ -95,8 +122,45 @@ def build_worker_assignments(
                 example_end=end,
             )
         )
-        start = end
 
+    return assignments
+
+
+def build_distributed_worker_assignments(
+    *,
+    num_examples: int,
+    worker_pairs: list[tuple[str | None, str | None]],
+    ray_nodes: list[RayNodeInfo],
+) -> list[WorkerAssignment]:
+    if not worker_pairs:
+        raise ValueError("At least one worker pair is required.")
+    if not ray_nodes:
+        raise ValueError("At least one Ray node is required.")
+    if num_examples <= 0:
+        return []
+
+    worker_descriptors: list[tuple[RayNodeInfo, int, str | None, str | None]] = []
+    for local_worker_index, (actor_dev, critic_dev) in enumerate(worker_pairs):
+        for node in ray_nodes:
+            worker_descriptors.append((node, local_worker_index, actor_dev, critic_dev))
+
+    assignments: list[WorkerAssignment] = []
+    ranges = _assignment_ranges(num_examples=num_examples, num_workers=len(worker_descriptors))
+    for worker_id, (start, end) in enumerate(ranges):
+        node, local_worker_index, actor_dev, critic_dev = worker_descriptors[worker_id]
+        assignments.append(
+            WorkerAssignment(
+                worker_id=worker_id,
+                actor_device=actor_dev,
+                critic_device=critic_dev,
+                example_start=start,
+                example_end=end,
+                node_index=node.node_index,
+                node_ip=node.node_ip,
+                node_resource_key=node.node_resource_key,
+                local_worker_index=local_worker_index,
+            )
+        )
     return assignments
 
 
