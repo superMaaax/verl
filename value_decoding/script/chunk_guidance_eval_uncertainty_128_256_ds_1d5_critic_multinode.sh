@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=chunk_guidance_256
+#SBATCH --job-name=chunk_uncertainty
 #SBATCH --account=ECS26006
 #SBATCH --partition=gh
 #SBATCH --nodes=4
@@ -40,7 +40,9 @@ python3 -V
 # -----------------------------
 # Run identity
 # -----------------------------
-RUN_NAME="chunk_guidance_eval_256_ds_1d5_critic"
+# Keep the run/output naming aligned with the actual grid from the source script:
+# CHUNK_SIZES="128 256"
+RUN_NAME="chunk_guidance_eval_uncertainty_128_256_ds_1d5_critic"
 RUN_ID="${RUN_NAME}_${SLURM_JOB_ID}"
 
 # -----------------------------
@@ -58,14 +60,14 @@ ARCHIVE_DIR="${ARCHIVE_ROOT}/${RUN_ID}"
 SCRATCH_ROOT="${SCRATCH}/value_decoding_runs"
 RUN_DIR="${SCRATCH_ROOT}/${RUN_ID}"
 LOG_DIR="${RUN_DIR}/logs"
-OUTPUT_DIR="${RUN_DIR}/chunk_guidance_eval_256_ds_1d5_critic"
+OUTPUT_DIR="${RUN_DIR}/chunk_guidance_eval_uncertainty_128_256_ds_1d5_critic"
 ACTOR_MERGED_ROOT="${RUN_DIR}/merged_actor_hf"
 CRITIC_MERGED_ROOT="${RUN_DIR}/merged_critic_hf"
 
 mkdir -p "$LOG_DIR" "$ARCHIVE_ROOT" "$OUTPUT_DIR"
 
 # -----------------------------
-# Chunk-guidance config
+# Uncertainty-only config
 # -----------------------------
 PROMPT_KEY="prompt"
 RESPONSE_KEY=""
@@ -87,13 +89,15 @@ ACTOR_TEMPERATURE=1.0
 ACTOR_TOP_P=1.0
 ACTOR_TOP_K=0
 
-CHUNK_SIZES="256"
-NUM_CHUNK_CANDIDATES_VALUES="2 4 8"
+CHUNK_SIZES="128 256"
+NUM_CHUNK_CANDIDATES_VALUES="8"
 BETAS="0"
 VALUE_REDUCERS="end"
-INCLUDE_CRITIC_ONLY=1
-INCLUDE_UNCERTAINTY_ONLY=0
-ONLY_CRITIC_ONLY=1
+INCLUDE_CRITIC_ONLY=0
+INCLUDE_UNCERTAINTY_ONLY=1
+ONLY_CRITIC_ONLY=0
+SKIP_ACTOR_ONLY_BASELINES=1
+DISABLE_CRITIC_MODEL=1
 
 NORMALIZATION_EPS="1e-6"
 SEED="42"
@@ -255,7 +259,7 @@ echo "Ray cluster status:"
 ray status --address="$ip_head" || true
 
 # -----------------------------
-# Run chunk-guidance eval
+# Run uncertainty-only eval
 # -----------------------------
 cd "$WORK_DIR"
 
@@ -316,9 +320,11 @@ run_one_seed() {
   [[ "$SHUFFLE_EXAMPLES" != "0" ]] && CMD+=(--shuffle_examples)
   [[ "$SKIP_MERGE" != "0" ]] && CMD+=(--skip_merge)
   [[ "$DISABLE_ACTOR_CACHE" != "0" ]] && CMD+=(--disable_actor_cache)
+  [[ "$DISABLE_CRITIC_MODEL" != "0" ]] && CMD+=(--disable_critic_model)
   [[ "$INCLUDE_CRITIC_ONLY" != "0" ]] && CMD+=(--include_critic_only)
   [[ "$INCLUDE_UNCERTAINTY_ONLY" != "0" ]] && CMD+=(--include_uncertainty_only)
   [[ "$ONLY_CRITIC_ONLY" != "0" ]] && CMD+=(--only_critic_only)
+  [[ "$SKIP_ACTOR_ONLY_BASELINES" != "0" ]] && CMD+=(--skip_actor_only_baselines)
   [[ "$DEBUG_FULL_CHUNK_CANDIDATES" != "0" ]] && CMD+=(--debug_full_chunk_candidates)
   [[ "$TRUST_REMOTE_CODE" != "0" ]] && CMD+=(--trust_remote_code)
 
@@ -330,8 +336,8 @@ run_one_seed() {
 }
 
 if [[ ${#SEED_ARR[@]} -eq 1 ]]; then
-  run_one_seed "${SEED_ARR[0]}" "$OUTPUT_DIR" "$LOG_DIR/chunk_guidance_eval.log"
-  echo "Chunk-guidance eval finished successfully."
+  run_one_seed "${SEED_ARR[0]}" "$OUTPUT_DIR" "$LOG_DIR/chunk_guidance_eval_uncertainty.log"
+  echo "Chunk-guidance uncertainty eval finished successfully."
   exit 0
 fi
 
@@ -340,7 +346,7 @@ SEED_OUTPUT_DIRS=()
 for seed_value in "${SEED_ARR[@]}"; do
   seed_id="$(seed_to_id "$seed_value")"
   seed_output_dir="${OUTPUT_DIR}/seed_${seed_id}"
-  seed_log_path="$LOG_DIR/chunk_guidance_eval__seed_${seed_id}.log"
+  seed_log_path="$LOG_DIR/chunk_guidance_eval_uncertainty__seed_${seed_id}.log"
   run_one_seed "$seed_value" "$seed_output_dir" "$seed_log_path"
   SUMMARY_PATHS+=("${seed_output_dir}/summary_metrics.json")
   SEED_OUTPUT_DIRS+=("${seed_output_dir}")
@@ -353,4 +359,4 @@ python3 -m value_decoding.multi_seed_summary \
   --summary_paths "${SUMMARY_PATHS[@]}" \
   --seed_output_dirs "${SEED_OUTPUT_DIRS[@]}"
 
-echo "Chunk-guidance eval finished successfully."
+echo "Chunk-guidance uncertainty eval finished successfully."

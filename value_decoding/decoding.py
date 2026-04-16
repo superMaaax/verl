@@ -208,6 +208,8 @@ def critic_sequence_last_values(
     *,
     attention_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids, device=input_ids.device)
     values = critic_sequence_values(critic, input_ids, attention_mask=attention_mask)
     last_indices = attention_mask.long().sum(dim=-1) - 1
     if torch.any(last_indices < 0):

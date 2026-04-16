@@ -2911,7 +2911,9 @@ def main() -> int:
     if ray_address is not None:
         ray_module = _require_ray()
         if not ray_module.is_initialized():
-            ray_module.init(address=ray_address, runtime_env=_build_ray_runtime_env(repo_root))
+            # Rely on the launcher to propagate PYTHONPATH / caches / environment.
+            # Passing runtime_env during ray.init(address=...) has been unreliable on this cluster.
+            ray_module.init(address=ray_address)
         ray_nodes = _discover_ray_nodes(ray_module)
         if not ray_nodes:
             raise ValueError("Ray is connected, but no alive Ray nodes were discovered.")
