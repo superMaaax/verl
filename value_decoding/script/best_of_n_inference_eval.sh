@@ -20,6 +20,9 @@ set -eo pipefail
 # -----------------------------
 ACTOR_CHECKPOINT_DIR="/data/shuozhe/verl/train_log/job_05b_vh_init_e5_metamath/global_step_800"
 CRITIC_CHECKPOINT_DIR="/data/shuozhe/verl/train_log/job_policy_gs800_dsk_1d5b_critic/global_step_750"
+ACTOR_HF_SOURCE_DIR=""
+OLD_CRITIC_HF_SOURCE_DIR=""
+NEW_CRITIC_HF_SOURCE_DIR=""
 
 ACTOR_MERGED_ROOT=""
 CRITIC_MERGED_ROOT=""
@@ -102,9 +105,52 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
 EXTRA_ARGS=("$@")
 
+validate_component_checkpoint() {
+  local checkpoint_dir="$1"
+  local component="$2"
+  python - "$checkpoint_dir" "$component" <<'PY'
+import sys
+from pathlib import Path
+
+from value_decoding.checkpointing import (
+    find_missing_hf_weight_files,
+    has_complete_hf_checkpoint,
+    has_fsdp_checkpoint_shards,
+    has_hf_config,
+)
+
+checkpoint_dir = Path(sys.argv[1])
+component = sys.argv[2]
+component_dir = checkpoint_dir / component
+
+if has_complete_hf_checkpoint(component_dir):
+    print(f"{component}: detected complete Hugging Face checkpoint at {component_dir}")
+    raise SystemExit(0)
+
+if has_fsdp_checkpoint_shards(component_dir):
+    print(f"{component}: detected raw FSDP checkpoint at {component_dir}")
+    raise SystemExit(0)
+
+if has_hf_config(component_dir):
+    missing_files = find_missing_hf_weight_files(component_dir)
+    missing_preview = ", ".join(path.name for path in missing_files[:5]) or "unknown weight shards"
+    if len(missing_files) > 5:
+        missing_preview += ", ..."
+    raise SystemExit(
+        f"{component}: incomplete Hugging Face checkpoint at {component_dir}. "
+        f"Missing files referenced by the index: {missing_preview}"
+    )
+
+raise SystemExit(f"{component}: unsupported checkpoint layout at {component_dir}")
+PY
+}
+
 read -r -a N_VALUES_ARR <<< "$N_VALUES"
 read -r -a WORKER_LAYOUTS_ARR <<< "$WORKER_LAYOUTS"
 read -r -a SEED_ARR <<< "$SEED"
+
+validate_component_checkpoint "$ACTOR_CHECKPOINT_DIR" actor
+validate_component_checkpoint "$CRITIC_CHECKPOINT_DIR" critic
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -160,6 +206,9 @@ run_one_seed() {
 
   [[ -n "$ACTOR_MERGED_ROOT" ]] && CMD+=(--actor_merged_root "$ACTOR_MERGED_ROOT")
   [[ -n "$CRITIC_MERGED_ROOT" ]] && CMD+=(--old_critic_merged_root "$CRITIC_MERGED_ROOT" --new_critic_merged_root "$CRITIC_MERGED_ROOT")
+  [[ -n "$ACTOR_HF_SOURCE_DIR" ]] && CMD+=(--actor_hf_source_dir "$ACTOR_HF_SOURCE_DIR")
+  [[ -n "$OLD_CRITIC_HF_SOURCE_DIR" ]] && CMD+=(--old_critic_hf_source_dir "$OLD_CRITIC_HF_SOURCE_DIR")
+  [[ -n "$NEW_CRITIC_HF_SOURCE_DIR" ]] && CMD+=(--new_critic_hf_source_dir "$NEW_CRITIC_HF_SOURCE_DIR")
   [[ -n "$RESPONSE_KEY" ]] && CMD+=(--response_key "$RESPONSE_KEY")
   [[ -n "$MAX_EXAMPLES" ]] && CMD+=(--max_examples "$MAX_EXAMPLES")
   [[ -n "$MAX_BANK_SIZE" ]] && CMD+=(--max_bank_size "$MAX_BANK_SIZE")

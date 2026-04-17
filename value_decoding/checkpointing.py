@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -10,16 +11,71 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Genera
 from verl.utils.model import load_valuehead_model
 
 
+HF_EXACT_WEIGHT_NAMES = ("model.safetensors", "pytorch_model.bin")
+HF_INDEX_WEIGHT_NAMES = ("model.safetensors.index.json", "pytorch_model.bin.index.json")
+HF_SHARD_PATTERNS = ("model-*.safetensors", "pytorch_model-*.bin")
+
+
+def _read_hf_index_shard_names(index_path: Path) -> list[str]:
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    weight_map = payload.get("weight_map")
+    if not isinstance(weight_map, dict):
+        return []
+
+    shard_names: list[str] = []
+    seen: set[str] = set()
+    for candidate in weight_map.values():
+        if not isinstance(candidate, str) or not candidate:
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        shard_names.append(candidate)
+    return shard_names
+
+
+def find_missing_hf_weight_files(model_dir: Path) -> list[Path]:
+    if not model_dir.exists():
+        return []
+
+    for name in HF_EXACT_WEIGHT_NAMES:
+        if (model_dir / name).is_file():
+            return []
+
+    for name in HF_INDEX_WEIGHT_NAMES:
+        index_path = model_dir / name
+        if not index_path.is_file():
+            continue
+        shard_names = _read_hf_index_shard_names(index_path)
+        if not shard_names:
+            return [index_path]
+        return [model_dir / shard_name for shard_name in shard_names if not (model_dir / shard_name).is_file()]
+
+    for pattern in HF_SHARD_PATTERNS:
+        if any(model_dir.glob(pattern)):
+            return []
+
+    return []
+
+
 def has_hf_weights(model_dir: Path) -> bool:
     if not model_dir.exists():
         return False
 
-    exact_names = ("model.safetensors", "pytorch_model.bin")
-    shard_patterns = ("model-*.safetensors", "pytorch_model-*.bin")
-    for name in exact_names:
-        if (model_dir / name).exists():
+    if find_missing_hf_weight_files(model_dir):
+        return False
+
+    for name in HF_EXACT_WEIGHT_NAMES:
+        if (model_dir / name).is_file():
             return True
-    for pattern in shard_patterns:
+    for name in HF_INDEX_WEIGHT_NAMES:
+        if (model_dir / name).is_file():
+            return True
+    for pattern in HF_SHARD_PATTERNS:
         if any(model_dir.glob(pattern)):
             return True
     return False
@@ -31,6 +87,14 @@ def has_hf_config(model_dir: Path) -> bool:
 
 def has_complete_hf_checkpoint(model_dir: Path) -> bool:
     return has_hf_weights(model_dir) and has_hf_config(model_dir)
+
+
+def has_fsdp_checkpoint_shards(model_dir: Path) -> bool:
+    if not model_dir.exists():
+        return False
+    if (model_dir / "fsdp_config.json").is_file():
+        return True
+    return any(model_dir.glob("model_world_size_*_rank_*.pt"))
 
 
 def _candidate_hf_source_dirs(
@@ -124,6 +188,28 @@ def ensure_merged_component_checkpoint(
             return existing_dir
 
     if not skip_merge and not has_complete_hf_checkpoint(target_dir):
+        if not has_fsdp_checkpoint_shards(local_dir):
+            if has_hf_config(local_dir):
+                missing_files = find_missing_hf_weight_files(local_dir)
+                missing_preview = ", ".join(str(path.name) for path in missing_files[:5])
+                if len(missing_files) > 5:
+                    missing_preview += ", ..."
+                raise FileNotFoundError(
+                    f"{component.capitalize()} checkpoint at {local_dir} looks like a Hugging Face checkpoint "
+                    "directory, but it does not contain a complete set of model weight files. "
+                    "Expected one of: model.safetensors, pytorch_model.bin, "
+                    "model.safetensors.index.json, pytorch_model.bin.index.json, or model-*.safetensors shards. "
+                    + (
+                        f"Missing files referenced by the index: {missing_preview}. "
+                        if missing_preview
+                        else ""
+                    )
+                    + "Please re-download the checkpoint or point the script at a complete local copy."
+                )
+            raise FileNotFoundError(
+                f"{component.capitalize()} checkpoint at {local_dir} is neither a complete Hugging Face checkpoint "
+                "nor a raw FSDP checkpoint (missing fsdp_config.json and model_world_size_*_rank_*.pt shards)."
+            )
         resolved_hf_source_dir = resolve_hf_source_dir(
             checkpoint_dir,
             component=component,

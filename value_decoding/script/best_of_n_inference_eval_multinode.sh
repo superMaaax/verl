@@ -61,6 +61,9 @@ LOG_DIR="${RUN_DIR}/logs"
 OUTPUT_DIR="${RUN_DIR}/best_of_n_inference_eval"
 ACTOR_MERGED_ROOT="${RUN_DIR}/merged_actor_hf"
 CRITIC_MERGED_ROOT="${RUN_DIR}/merged_critic_hf"
+ACTOR_HF_SOURCE_DIR=""
+OLD_CRITIC_HF_SOURCE_DIR=""
+NEW_CRITIC_HF_SOURCE_DIR=""
 
 mkdir -p "$LOG_DIR" "$ARCHIVE_ROOT" "$OUTPUT_DIR"
 
@@ -126,6 +129,46 @@ stop_ray_all_nodes() {
   done
 }
 
+validate_component_checkpoint() {
+  local checkpoint_dir="$1"
+  local component="$2"
+  python3 - "$checkpoint_dir" "$component" <<'PY'
+import sys
+from pathlib import Path
+
+from value_decoding.checkpointing import (
+    find_missing_hf_weight_files,
+    has_complete_hf_checkpoint,
+    has_fsdp_checkpoint_shards,
+    has_hf_config,
+)
+
+checkpoint_dir = Path(sys.argv[1])
+component = sys.argv[2]
+component_dir = checkpoint_dir / component
+
+if has_complete_hf_checkpoint(component_dir):
+    print(f"{component}: detected complete Hugging Face checkpoint at {component_dir}")
+    raise SystemExit(0)
+
+if has_fsdp_checkpoint_shards(component_dir):
+    print(f"{component}: detected raw FSDP checkpoint at {component_dir}")
+    raise SystemExit(0)
+
+if has_hf_config(component_dir):
+    missing_files = find_missing_hf_weight_files(component_dir)
+    missing_preview = ", ".join(path.name for path in missing_files[:5]) or "unknown weight shards"
+    if len(missing_files) > 5:
+        missing_preview += ", ..."
+    raise SystemExit(
+        f"{component}: incomplete Hugging Face checkpoint at {component_dir}. "
+        f"Missing files referenced by the index: {missing_preview}"
+    )
+
+raise SystemExit(f"{component}: unsupported checkpoint layout at {component_dir}")
+PY
+}
+
 count_alive_ray_nodes() {
   local ray_address="$1"
   python3 - "$ray_address" <<'PY'
@@ -169,6 +212,8 @@ ls -ld "$WORK_DIR"
 ls -ld "$ACTOR_CHECKPOINT_DIR"
 ls -ld "$CRITIC_CHECKPOINT_DIR"
 ls -lh "$DATASET_PATH"
+validate_component_checkpoint "$ACTOR_CHECKPOINT_DIR" actor
+validate_component_checkpoint "$CRITIC_CHECKPOINT_DIR" critic
 
 nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
 nodes_array=($nodes)
@@ -336,6 +381,9 @@ run_one_seed() {
     --ray_num_cpus_per_worker "$RAY_NUM_CPUS_PER_WORKER"
   )
 
+  [[ -n "$ACTOR_HF_SOURCE_DIR" ]] && CMD+=(--actor_hf_source_dir "$ACTOR_HF_SOURCE_DIR")
+  [[ -n "$OLD_CRITIC_HF_SOURCE_DIR" ]] && CMD+=(--old_critic_hf_source_dir "$OLD_CRITIC_HF_SOURCE_DIR")
+  [[ -n "$NEW_CRITIC_HF_SOURCE_DIR" ]] && CMD+=(--new_critic_hf_source_dir "$NEW_CRITIC_HF_SOURCE_DIR")
   [[ -n "$RESPONSE_KEY" ]] && CMD+=(--response_key "$RESPONSE_KEY")
   [[ -n "$MAX_EXAMPLES" ]] && CMD+=(--max_examples "$MAX_EXAMPLES")
   [[ -n "$MAX_BANK_SIZE" ]] && CMD+=(--max_bank_size "$MAX_BANK_SIZE")

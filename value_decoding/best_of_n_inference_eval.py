@@ -206,16 +206,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=str, required=True, help="Directory for experiment artifacts.")
     parser.add_argument("--actor_merged_root", type=str, default=None, help="Optional merged HF root for actor.")
     parser.add_argument(
+        "--actor_hf_source_dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional Hugging Face config/tokenizer directory for the actor merge. "
+            "Use this when the raw actor checkpoint was copied without actor/huggingface."
+        ),
+    )
+    parser.add_argument(
         "--old_critic_merged_root",
         type=str,
         default=None,
         help="Optional merged HF root for the old critic.",
     )
     parser.add_argument(
+        "--old_critic_hf_source_dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional Hugging Face config/tokenizer directory for the old critic merge. "
+            "Use this when the raw old critic checkpoint was copied without critic/huggingface."
+        ),
+    )
+    parser.add_argument(
         "--new_critic_merged_root",
         type=str,
         default=None,
         help="Optional merged HF root for the new critic.",
+    )
+    parser.add_argument(
+        "--new_critic_hf_source_dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional Hugging Face config/tokenizer directory for the new critic merge. "
+            "Use this when the raw new critic checkpoint was copied without critic/huggingface."
+        ),
     )
     parser.add_argument(
         "--reference_stage1_trajectory_bank",
@@ -2315,18 +2342,21 @@ def main() -> int:
         actor_checkpoint_dir,
         component="actor",
         merged_root=Path(args.actor_merged_root).resolve() if args.actor_merged_root else None,
+        hf_source_dir=Path(args.actor_hf_source_dir).resolve() if args.actor_hf_source_dir else None,
         skip_merge=args.skip_merge,
     )
     old_critic_hf_dir = ensure_merged_component_checkpoint(
         old_critic_checkpoint_dir,
         component="critic",
         merged_root=Path(args.old_critic_merged_root).resolve() if args.old_critic_merged_root else None,
+        hf_source_dir=Path(args.old_critic_hf_source_dir).resolve() if args.old_critic_hf_source_dir else None,
         skip_merge=args.skip_merge,
     )
     new_critic_hf_dir = ensure_merged_component_checkpoint(
         new_critic_checkpoint_dir,
         component="critic",
         merged_root=Path(args.new_critic_merged_root).resolve() if args.new_critic_merged_root else None,
+        hf_source_dir=Path(args.new_critic_hf_source_dir).resolve() if args.new_critic_hf_source_dir else None,
         skip_merge=args.skip_merge,
     )
     shared_critic_checkpoint = _same_resolved_path(old_critic_hf_dir, new_critic_hf_dir)

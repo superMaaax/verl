@@ -73,12 +73,55 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
 
+validate_component_checkpoint() {
+  local checkpoint_dir="$1"
+  local component="$2"
+  python - "$checkpoint_dir" "$component" <<'PY'
+import sys
+from pathlib import Path
+
+from value_decoding.checkpointing import (
+    find_missing_hf_weight_files,
+    has_complete_hf_checkpoint,
+    has_fsdp_checkpoint_shards,
+    has_hf_config,
+)
+
+checkpoint_dir = Path(sys.argv[1])
+component = sys.argv[2]
+component_dir = checkpoint_dir / component
+
+if has_complete_hf_checkpoint(component_dir):
+    print(f"{component}: detected complete Hugging Face checkpoint at {component_dir}")
+    raise SystemExit(0)
+
+if has_fsdp_checkpoint_shards(component_dir):
+    print(f"{component}: detected raw FSDP checkpoint at {component_dir}")
+    raise SystemExit(0)
+
+if has_hf_config(component_dir):
+    missing_files = find_missing_hf_weight_files(component_dir)
+    missing_preview = ", ".join(path.name for path in missing_files[:5]) or "unknown weight shards"
+    if len(missing_files) > 5:
+        missing_preview += ", ..."
+    raise SystemExit(
+        f"{component}: incomplete Hugging Face checkpoint at {component_dir}. "
+        f"Missing files referenced by the index: {missing_preview}"
+    )
+
+raise SystemExit(f"{component}: unsupported checkpoint layout at {component_dir}")
+PY
+}
+
 read -r -a CHUNK_SIZES_ARR <<< "${CHUNK_SIZES}"
 read -r -a NUM_CHUNK_CANDIDATES_VALUES_ARR <<< "${NUM_CHUNK_CANDIDATES_VALUES}"
 read -r -a BETAS_ARR <<< "${BETAS}"
 read -r -a VALUE_REDUCERS_ARR <<< "${VALUE_REDUCERS}"
 read -r -a WORKER_PAIRS_ARR <<< "${WORKER_PAIRS}"
 read -r -a SEED_ARR <<< "${SEED}"
+
+validate_component_checkpoint "${ACTOR_CHECKPOINT_DIR}" actor
+validate_component_checkpoint "${CRITIC_CHECKPOINT_DIR}" critic
 
 mkdir -p "${OUTPUT_DIR}"
 
