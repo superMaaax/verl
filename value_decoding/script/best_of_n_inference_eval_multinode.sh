@@ -2,10 +2,10 @@
 #SBATCH --job-name=best_of_n_eval
 #SBATCH --account=ECS26006
 #SBATCH --partition=gh
-#SBATCH --nodes=4
+#SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=72
-#SBATCH --time=24:00:00
+#SBATCH --time=10:00:00
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
@@ -46,8 +46,8 @@ RUN_ID="${RUN_NAME}_${SLURM_JOB_ID}"
 # -----------------------------
 # Paths
 # -----------------------------
-ACTOR_CHECKPOINT_DIR="/work2/09576/shuozhe/verl/train_log/job_05b_vh_init_e5_metamath/global_step_800"
-CRITIC_CHECKPOINT_DIR="/work2/09576/shuozhe/verl/train_log/job_policy_gs800_dsk_1d5b_critic/global_step_750"
+ACTOR_CHECKPOINT_DIR="/work2/09576/shuozhe/saved_model/Qwen2.5_7B_PPO_global_step_1000"
+CRITIC_CHECKPOINT_DIR="/work2/09576/shuozhe/saved_model/Qwen2.5_7B_PPO_global_step_1000"
 DATASET_PATH="/work2/09576/shuozhe/saved_dataset/MetaMathQA-math-500/test.parquet"
 WORK_DIR="/work2/09576/shuozhe/verl"
 export PYTHONPATH="${WORK_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -93,7 +93,7 @@ ACTOR_SAMPLING_MODE="sample"
 ACTOR_TEMPERATURE=1.0
 ACTOR_TOP_P=1.0
 ACTOR_TOP_K=0
-SEED="42"
+SEED="42 111 222"
 
 REFERENCE_STAGE1_TRAJECTORY_BANK=""
 SKIP_PLOTS=0
