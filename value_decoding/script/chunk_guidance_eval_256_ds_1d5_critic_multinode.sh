@@ -2,10 +2,10 @@
 #SBATCH --job-name=chunk_guidance_7b_seed_42
 #SBATCH --account=ECS26006
 #SBATCH --partition=gh
-#SBATCH --nodes=2
+#SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=72
-#SBATCH --time=00:12:00
+#SBATCH --time=00:11:00
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
