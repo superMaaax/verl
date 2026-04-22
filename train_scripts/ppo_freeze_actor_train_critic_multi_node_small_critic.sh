@@ -48,7 +48,7 @@ python3 -V
 # -----------------------------
 # Run identity
 # -----------------------------
-RUN_NAME="7b_dsk_critic"
+RUN_NAME="7b_actor_1d5_dsk_critic"
 REAL_SLURM_JOB_ID="${SLURM_JOB_ID}"
 RUN_ID="${RUN_NAME}_${REAL_SLURM_JOB_ID}"
 
