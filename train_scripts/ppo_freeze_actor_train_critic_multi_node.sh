@@ -5,7 +5,7 @@
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=72
-#SBATCH --time=00:20:00
+#SBATCH --time=03:00:00
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
@@ -354,8 +354,8 @@ python3 -m verl.trainer.main_ppo \
   trainer.val_before_train=True \
   trainer.n_gpus_per_node=1 \
   trainer.nnodes="${SLURM_JOB_NUM_NODES}" \
-  trainer.test_freq=50 \
-  trainer.save_freq=50 \
+  trainer.test_freq=20 \
+  trainer.save_freq=20 \
   trainer.total_epochs=5 \
   trainer.logger='["console","wandb"]' \
   trainer.project_name="PPO_metamath" \
