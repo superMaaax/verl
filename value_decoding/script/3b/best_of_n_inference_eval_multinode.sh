@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=best_of_n_eval
+#SBATCH --job-name=best_of_n_Qwen2.5_3B_PPO
 #SBATCH --account=ECS26006
 #SBATCH --partition=gh
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=72
-#SBATCH --time=10:00:00
+#SBATCH --time=00:10:00
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
