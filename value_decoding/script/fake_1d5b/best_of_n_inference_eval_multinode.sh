@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=best_of_n_Qwen2.5_1d5B_PPO
+#SBATCH --job-name=best_of_n_eval_1d5b
 #SBATCH --account=ECS26006
 #SBATCH --partition=gh
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=72
-#SBATCH --time=7:00:00
+#SBATCH --time=10:00:00
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
@@ -40,14 +40,14 @@ python3 -V
 # -----------------------------
 # Run identity
 # -----------------------------
-RUN_NAME="best_of_n_Qwen2.5_1d5B_PPO"
+RUN_NAME="best_of_n_inference_eval"
 RUN_ID="${RUN_NAME}_${SLURM_JOB_ID}"
 
 # -----------------------------
 # Paths
 # -----------------------------
-ACTOR_CHECKPOINT_DIR="/work2/09576/shuozhe/saved_model/Prathyusha101/Qwen2.5_1.5B_PPO_global_step_1000"
-CRITIC_CHECKPOINT_DIR="/work2/09576/shuozhe/saved_model/Prathyusha101/Qwen2.5_1.5B_PPO_global_step_1000"
+ACTOR_CHECKPOINT_DIR="/work/09576/shuozhe/saved_model/Qwen2.5_1.5b_global_step_850"
+CRITIC_CHECKPOINT_DIR="/work/09576/shuozhe/saved_model/Qwen2.5_1.5b_global_step_850"
 DATASET_PATH="/work2/09576/shuozhe/saved_dataset/MetaMathQA-math-500/test.parquet"
 WORK_DIR="/work2/09576/shuozhe/verl"
 export PYTHONPATH="${WORK_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -93,7 +93,7 @@ ACTOR_SAMPLING_MODE="sample"
 ACTOR_TEMPERATURE=1.0
 ACTOR_TOP_P=1.0
 ACTOR_TOP_K=0
-SEED="42"
+SEED="42 111 222"
 
 REFERENCE_STAGE1_TRAJECTORY_BANK=""
 SKIP_PLOTS=0

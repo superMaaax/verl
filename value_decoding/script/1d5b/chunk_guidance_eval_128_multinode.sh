@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=best_of_n_Qwen2.5_1d5B_PPO
+#SBATCH --job-name=chunk_guidance_eval_1d5b_128_seed_42
 #SBATCH --account=ECS26006
 #SBATCH --partition=gh
-#SBATCH --nodes=8
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=72
-#SBATCH --time=7:00:00
+#SBATCH --time=20:00:00
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
@@ -40,7 +40,7 @@ python3 -V
 # -----------------------------
 # Run identity
 # -----------------------------
-RUN_NAME="best_of_n_Qwen2.5_1d5B_PPO"
+RUN_NAME="chunk_guidance_eval_1d5b_128_seed_42"
 RUN_ID="${RUN_NAME}_${SLURM_JOB_ID}"
 
 # -----------------------------
@@ -58,17 +58,18 @@ ARCHIVE_DIR="${ARCHIVE_ROOT}/${RUN_ID}"
 SCRATCH_ROOT="${SCRATCH}/value_decoding_runs"
 RUN_DIR="${SCRATCH_ROOT}/${RUN_ID}"
 LOG_DIR="${RUN_DIR}/logs"
-OUTPUT_DIR="${RUN_DIR}/best_of_n_inference_eval"
+OUTPUT_DIR="${RUN_DIR}/chunk_guidance_eval_1d5b_128_seed_42"
 ACTOR_MERGED_ROOT="${RUN_DIR}/merged_actor_hf"
 CRITIC_MERGED_ROOT="${RUN_DIR}/merged_critic_hf"
+# Optional override directories for HF config/tokenizer metadata used during FSDP merge.
+# Set these if the raw checkpoint was copied without actor/critic/huggingface.
 ACTOR_HF_SOURCE_DIR=""
-OLD_CRITIC_HF_SOURCE_DIR=""
-NEW_CRITIC_HF_SOURCE_DIR=""
+CRITIC_HF_SOURCE_DIR=""
 
 mkdir -p "$LOG_DIR" "$ARCHIVE_ROOT" "$OUTPUT_DIR"
 
 # -----------------------------
-# Best-of-N config
+# Chunk-guidance config
 # -----------------------------
 PROMPT_KEY="prompt"
 RESPONSE_KEY=""
@@ -76,32 +77,35 @@ START_INDEX=0
 MAX_EXAMPLES=500
 SHUFFLE_EXAMPLES=0
 
-N_VALUES="2 4 8"
-MAX_BANK_SIZE=""
 MAX_PROMPT_LENGTH=2048
 MAX_NEW_TOKENS=2048
-CRITIC_SCORE_BATCH_SIZE=8
-BOOTSTRAP_SAMPLES=2000
 DTYPE="bf16"
 
 # This is the per-node local layout.
 # In the current 1-GPU-per-node Slurm setup, keep this as cuda:0.
-# If you later move to multi-GPU nodes, update both WORKER_LAYOUTS and RAY_GPUS_PER_NODE.
-WORKER_LAYOUTS="cuda:0"
+# If you later move to multi-GPU nodes, update both WORKER_PAIRS and RAY_GPUS_PER_NODE.
+WORKER_PAIRS="cuda:0"
 
 ACTOR_SAMPLING_MODE="sample"
 ACTOR_TEMPERATURE=1.0
 ACTOR_TOP_P=1.0
 ACTOR_TOP_K=0
+
+# CHUNK_SIZES="64 128 256 512"
+CHUNK_SIZES="128"
+NUM_CHUNK_CANDIDATES_VALUES="2 4 8"
+BETAS="0"
+VALUE_REDUCERS="end"
+INCLUDE_CRITIC_ONLY=1
+INCLUDE_UNCERTAINTY_ONLY=0
+ONLY_CRITIC_ONLY=1
+
+NORMALIZATION_EPS="1e-6"
 SEED="42"
-
-REFERENCE_STAGE1_TRAJECTORY_BANK=""
-SKIP_PLOTS=0
-PLOT_DPI=160
-
-TRUST_REMOTE_CODE=0
 SKIP_MERGE=0
 DISABLE_ACTOR_CACHE=0
+DEBUG_FULL_CHUNK_CANDIDATES=0
+TRUST_REMOTE_CODE=0
 RAY_NUM_CPUS_PER_WORKER=1
 RAY_GPUS_PER_NODE=1
 
@@ -328,12 +332,15 @@ echo "Ray cluster status:"
 ray status --address="$ip_head" || true
 
 # -----------------------------
-# Run best-of-N eval
+# Run chunk-guidance eval
 # -----------------------------
 cd "$WORK_DIR"
 
-read -r -a N_VALUES_ARR <<< "$N_VALUES"
-read -r -a WORKER_LAYOUTS_ARR <<< "$WORKER_LAYOUTS"
+read -r -a CHUNK_SIZES_ARR <<< "$CHUNK_SIZES"
+read -r -a NUM_CHUNK_CANDIDATES_VALUES_ARR <<< "$NUM_CHUNK_CANDIDATES_VALUES"
+read -r -a BETAS_ARR <<< "$BETAS"
+read -r -a VALUE_REDUCERS_ARR <<< "$VALUE_REDUCERS"
+read -r -a WORKER_PAIRS_ARR <<< "$WORKER_PAIRS"
 read -r -a SEED_ARR <<< "$SEED"
 
 if [[ ${#SEED_ARR[@]} -eq 0 ]]; then
@@ -354,46 +361,45 @@ run_one_seed() {
   local log_path="$3"
 
   CMD=(
-    python3 -m value_decoding.best_of_n_inference_eval
+    python3 -m value_decoding.chunk_guidance_eval
     --actor_checkpoint_dir "$ACTOR_CHECKPOINT_DIR"
-    --old_critic_checkpoint_dir "$CRITIC_CHECKPOINT_DIR"
-    --new_critic_checkpoint_dir "$CRITIC_CHECKPOINT_DIR"
+    --critic_checkpoint_dir "$CRITIC_CHECKPOINT_DIR"
     --dataset_path "$DATASET_PATH"
     --output_dir "$output_dir_for_seed"
     --actor_merged_root "$ACTOR_MERGED_ROOT"
-    --old_critic_merged_root "$CRITIC_MERGED_ROOT"
-    --new_critic_merged_root "$CRITIC_MERGED_ROOT"
+    --critic_merged_root "$CRITIC_MERGED_ROOT"
     --prompt_key "$PROMPT_KEY"
     --start_index "$START_INDEX"
     --max_prompt_length "$MAX_PROMPT_LENGTH"
     --max_new_tokens "$MAX_NEW_TOKENS"
-    --critic_score_batch_size "$CRITIC_SCORE_BATCH_SIZE"
-    --bootstrap_samples "$BOOTSTRAP_SAMPLES"
     --dtype "$DTYPE"
+    --normalization_eps "$NORMALIZATION_EPS"
     --seed "$seed_value"
     --actor_sampling_mode "$ACTOR_SAMPLING_MODE"
     --actor_temperature "$ACTOR_TEMPERATURE"
     --actor_top_p "$ACTOR_TOP_P"
     --actor_top_k "$ACTOR_TOP_K"
-    --n_values "${N_VALUES_ARR[@]}"
-    --plot_dpi "$PLOT_DPI"
+    --chunk_sizes "${CHUNK_SIZES_ARR[@]}"
+    --num_chunk_candidates_values "${NUM_CHUNK_CANDIDATES_VALUES_ARR[@]}"
+    --betas "${BETAS_ARR[@]}"
+    --value_reducers "${VALUE_REDUCERS_ARR[@]}"
     --ray_address auto
     --ray_num_cpus_per_worker "$RAY_NUM_CPUS_PER_WORKER"
   )
 
-  [[ -n "$ACTOR_HF_SOURCE_DIR" ]] && CMD+=(--actor_hf_source_dir "$ACTOR_HF_SOURCE_DIR")
-  [[ -n "$OLD_CRITIC_HF_SOURCE_DIR" ]] && CMD+=(--old_critic_hf_source_dir "$OLD_CRITIC_HF_SOURCE_DIR")
-  [[ -n "$NEW_CRITIC_HF_SOURCE_DIR" ]] && CMD+=(--new_critic_hf_source_dir "$NEW_CRITIC_HF_SOURCE_DIR")
   [[ -n "$RESPONSE_KEY" ]] && CMD+=(--response_key "$RESPONSE_KEY")
   [[ -n "$MAX_EXAMPLES" ]] && CMD+=(--max_examples "$MAX_EXAMPLES")
-  [[ -n "$MAX_BANK_SIZE" ]] && CMD+=(--max_bank_size "$MAX_BANK_SIZE")
-  [[ ${#WORKER_LAYOUTS_ARR[@]} -gt 0 ]] && CMD+=(--worker_layouts "${WORKER_LAYOUTS_ARR[@]}")
-  [[ -n "$REFERENCE_STAGE1_TRAJECTORY_BANK" ]] && CMD+=(--reference_stage1_trajectory_bank "$REFERENCE_STAGE1_TRAJECTORY_BANK")
+  [[ -n "$ACTOR_HF_SOURCE_DIR" ]] && CMD+=(--actor_hf_source_dir "$ACTOR_HF_SOURCE_DIR")
+  [[ -n "$CRITIC_HF_SOURCE_DIR" ]] && CMD+=(--critic_hf_source_dir "$CRITIC_HF_SOURCE_DIR")
+  [[ ${#WORKER_PAIRS_ARR[@]} -gt 0 ]] && CMD+=(--worker_pairs "${WORKER_PAIRS_ARR[@]}")
   [[ "$SHUFFLE_EXAMPLES" != "0" ]] && CMD+=(--shuffle_examples)
-  [[ "$TRUST_REMOTE_CODE" != "0" ]] && CMD+=(--trust_remote_code)
   [[ "$SKIP_MERGE" != "0" ]] && CMD+=(--skip_merge)
   [[ "$DISABLE_ACTOR_CACHE" != "0" ]] && CMD+=(--disable_actor_cache)
-  [[ "$SKIP_PLOTS" != "0" ]] && CMD+=(--skip_plots)
+  [[ "$INCLUDE_CRITIC_ONLY" != "0" ]] && CMD+=(--include_critic_only)
+  [[ "$INCLUDE_UNCERTAINTY_ONLY" != "0" ]] && CMD+=(--include_uncertainty_only)
+  [[ "$ONLY_CRITIC_ONLY" != "0" ]] && CMD+=(--only_critic_only)
+  [[ "$DEBUG_FULL_CHUNK_CANDIDATES" != "0" ]] && CMD+=(--debug_full_chunk_candidates)
+  [[ "$TRUST_REMOTE_CODE" != "0" ]] && CMD+=(--trust_remote_code)
 
   mkdir -p "$output_dir_for_seed"
   printf 'Running command for seed %s:\n' "$seed_value"
@@ -403,8 +409,8 @@ run_one_seed() {
 }
 
 if [[ ${#SEED_ARR[@]} -eq 1 ]]; then
-  run_one_seed "${SEED_ARR[0]}" "$OUTPUT_DIR" "$LOG_DIR/best_of_n_inference_eval.log"
-  echo "Best-of-N eval finished successfully."
+  run_one_seed "${SEED_ARR[0]}" "$OUTPUT_DIR" "$LOG_DIR/chunk_guidance_eval.log"
+  echo "Chunk-guidance eval finished successfully."
   exit 0
 fi
 
@@ -413,7 +419,7 @@ SEED_OUTPUT_DIRS=()
 for seed_value in "${SEED_ARR[@]}"; do
   seed_id="$(seed_to_id "$seed_value")"
   seed_output_dir="${OUTPUT_DIR}/seed_${seed_id}"
-  seed_log_path="$LOG_DIR/best_of_n_inference_eval__seed_${seed_id}.log"
+  seed_log_path="$LOG_DIR/chunk_guidance_eval__seed_${seed_id}.log"
   run_one_seed "$seed_value" "$seed_output_dir" "$seed_log_path"
   SUMMARY_PATHS+=("${seed_output_dir}/summary_metrics.json")
   SEED_OUTPUT_DIRS+=("${seed_output_dir}")
@@ -426,4 +432,4 @@ python3 -m value_decoding.multi_seed_summary \
   --summary_paths "${SUMMARY_PATHS[@]}" \
   --seed_output_dirs "${SEED_OUTPUT_DIRS[@]}"
 
-echo "Best-of-N eval finished successfully."
+echo "Chunk-guidance eval finished successfully."
