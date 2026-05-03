@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=chunk_guidance_7b_1d5_critic_256_8
+#SBATCH --job-name=chunk_guidance_7b_1d5_critic_256_8_gsm8k
 #SBATCH --account=ECS26006
 #SBATCH --partition=gh
 #SBATCH --nodes=8
@@ -40,7 +40,7 @@ python3 -V
 # -----------------------------
 # Run identity
 # -----------------------------
-RUN_NAME="chunk_guidance_eval_7b_1d5_critic_256_8"
+RUN_NAME="chunk_guidance_eval_7b_1d5_critic_256_8_gsm8k"
 RUN_ID="${RUN_NAME}_${SLURM_JOB_ID}"
 
 # -----------------------------
@@ -48,7 +48,8 @@ RUN_ID="${RUN_NAME}_${SLURM_JOB_ID}"
 # -----------------------------
 ACTOR_CHECKPOINT_DIR="/scratch/09576/shuozhe/verl_runs/7b_actor_1d5_dsk_critic_676393/train_log/global_step_950"
 CRITIC_CHECKPOINT_DIR="/scratch/09576/shuozhe/verl_runs/7b_actor_1d5_dsk_critic_676393/train_log/global_step_950"
-DATASET_PATH="/work2/09576/shuozhe/saved_dataset/MetaMathQA-math-500/test.parquet"
+# DATASET_PATH="/work2/09576/shuozhe/saved_dataset/MetaMathQA-math-500/test.parquet"
+DATASET_PATH="/work2/09576/shuozhe/saved_dataset/MetaMathQA-math-500/gsm8k_test.parquet"
 WORK_DIR="/work2/09576/shuozhe/verl"
 export PYTHONPATH="${WORK_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -58,7 +59,7 @@ ARCHIVE_DIR="${ARCHIVE_ROOT}/${RUN_ID}"
 SCRATCH_ROOT="${SCRATCH}/value_decoding_runs"
 RUN_DIR="${SCRATCH_ROOT}/${RUN_ID}"
 LOG_DIR="${RUN_DIR}/logs"
-OUTPUT_DIR="${RUN_DIR}/chunk_guidance_eval_7b_1d5_critic_256_8"
+OUTPUT_DIR="${RUN_DIR}/chunk_guidance_eval_7b_1d5_critic_256_8_gsm8k"
 ACTOR_MERGED_ROOT="${RUN_DIR}/merged_actor_hf"
 CRITIC_MERGED_ROOT="${RUN_DIR}/merged_critic_hf"
 # Optional override directories for HF config/tokenizer metadata used during FSDP merge.
