@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=best_of_n_eval
+#SBATCH --job-name=best_of_n_Qwen2.5_7B_critic_1d5_k_8
 #SBATCH --account=ECS26006
 #SBATCH --partition=gh
 #SBATCH --nodes=8
@@ -40,14 +40,14 @@ python3 -V
 # -----------------------------
 # Run identity
 # -----------------------------
-RUN_NAME="best_of_n_Qwen2.5_3B_PPO"
+RUN_NAME="best_of_n_Qwen2.5_7B_critic_1d5_k_8"
 RUN_ID="${RUN_NAME}_${SLURM_JOB_ID}"
 
 # -----------------------------
 # Paths
 # -----------------------------
-ACTOR_CHECKPOINT_DIR="/work2/09576/shuozhe/saved_model/Prathyusha101/Qwen2.5_3B_PPO_global_step_1000"
-CRITIC_CHECKPOINT_DIR="/work2/09576/shuozhe/saved_model/Prathyusha101/Qwen2.5_3B_PPO_global_step_1000"
+ACTOR_CHECKPOINT_DIR="/scratch/09576/shuozhe/verl_runs/7b_actor_1d5_dsk_critic_676393/train_log/global_step_950"
+CRITIC_CHECKPOINT_DIR="/scratch/09576/shuozhe/verl_runs/7b_actor_1d5_dsk_critic_676393/train_log/global_step_950"
 DATASET_PATH="/work2/09576/shuozhe/saved_dataset/MetaMathQA-math-500/test.parquet"
 WORK_DIR="/work2/09576/shuozhe/verl"
 export PYTHONPATH="${WORK_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -76,7 +76,8 @@ START_INDEX=0
 MAX_EXAMPLES=500
 SHUFFLE_EXAMPLES=0
 
-N_VALUES="2 4 8"
+# N_VALUES="2 4 8"
+N_VALUES="8"
 MAX_BANK_SIZE=""
 MAX_PROMPT_LENGTH=2048
 MAX_NEW_TOKENS=2048
