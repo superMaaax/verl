@@ -37,15 +37,15 @@
 #   --out_dir /data/shuozhe/verl/critic_debug/05b_vh_init_e5_gru_step_450_zero_weight_hh_l1 \
 #   --ablation zero_weight_hh
 
+  # --ablation no_direct_carry
+
+# test_math_5000.parquet
+
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-torchrun --standalone --nproc_per_node=4 eval_scripts/debug_critic_values_all.py \
-  --checkpoint_dir /data/shuozhe/verl/train_log/job_05b_vh_init_e5_gru/global_step_450 \
-  --dataset_path /data/shuozhe/saved_dataset/verl_math_7500_500_5000/test_5000.parquet \
+torchrun --standalone --nproc_per_node=4 eval_scripts/plot/debug_critic_values_all.py \
+  --checkpoint_dir /data/shuozhe/verl/train_log/job_policy_gs800_dsk_1d5b_critic/global_step_750 \
+  --dataset_path /data/shuozhe/saved_dataset/MetaMathQA-math-500/test_math_5000.parquet \
   --correct_match verl \
-  --max_new_tokens 2048 \
+  --max_new_tokens 1024 \
   --levels "Level 1" \
-  --out_dir /data/shuozhe/verl/critic_debug/05b_vh_init_e5_gru_step_450_no_direct_carry_l1 \
-  --ablation no_direct_carry
-
-
-  # --levels "Level 4" \
+  --out_dir /data/shuozhe/verl/critic_debug/dsk_1d5b_critic_step_750_test_math_5000_level_1 \
