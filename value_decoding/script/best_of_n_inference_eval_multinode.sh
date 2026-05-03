@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=best_of_n_Qwen2.5_7B_critic_1d5_k_8
+#SBATCH --job-name=best_of_n_Qwen2.5_7B_critic_1d5_k_8_gsm8k
 #SBATCH --account=ECS26006
 #SBATCH --partition=gh
 #SBATCH --nodes=8
@@ -40,7 +40,7 @@ python3 -V
 # -----------------------------
 # Run identity
 # -----------------------------
-RUN_NAME="best_of_n_Qwen2.5_7B_critic_1d5_k_8"
+RUN_NAME="best_of_n_Qwen2.5_7B_critic_1d5_k_8_gsm8k"
 RUN_ID="${RUN_NAME}_${SLURM_JOB_ID}"
 
 # -----------------------------
@@ -48,7 +48,7 @@ RUN_ID="${RUN_NAME}_${SLURM_JOB_ID}"
 # -----------------------------
 ACTOR_CHECKPOINT_DIR="/scratch/09576/shuozhe/verl_runs/7b_actor_1d5_dsk_critic_676393/train_log/global_step_950"
 CRITIC_CHECKPOINT_DIR="/scratch/09576/shuozhe/verl_runs/7b_actor_1d5_dsk_critic_676393/train_log/global_step_950"
-DATASET_PATH="/work2/09576/shuozhe/saved_dataset/MetaMathQA-math-500/test.parquet"
+DATASET_PATH="/work2/09576/shuozhe/saved_dataset/MetaMathQA-math-500/gsm8k_test.parquet"
 WORK_DIR="/work2/09576/shuozhe/verl"
 export PYTHONPATH="${WORK_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
