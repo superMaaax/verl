@@ -326,6 +326,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
               (if use_critic=True)
             - critic/vf_rho: Var(returns - values) / Var(returns) on valid response tokens (if use_critic=True)
             - critic/vf_explained_var: Explained variance of the value function (if use_critic=True)
+            - critic/prompt_end_vs_reward_gap: Mean absolute per-trajectory gap between prompt-end values
+              and accumulated sequence rewards (if use_critic=True)
+            - critic/trajectory_end_vs_reward_gap: Mean absolute per-trajectory gap between trajectory-end values
+              and accumulated sequence rewards (if use_critic=True)
             - critic/rollout_return/* and prompt/end-vs-return diagnostics when rollout_returns are available
             - response_length/mean, max, min, clip_ratio: Statistics about response lengths
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
@@ -397,6 +401,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             position="last",
         )
         trajectory_end_value_mean = _mean_or_zero(trajectory_end_values)
+        # Compare aligned per-trajectory endpoint values against the same rows'
+        # undiscounted accumulated rewards before averaging across the batch.
+        prompt_end_vs_reward_gap = _mean_or_zero(torch.abs(prompt_end_values - valid_sequence_reward))
+        trajectory_end_vs_reward_gap = _mean_or_zero(torch.abs(trajectory_end_values - valid_sequence_reward))
 
         prompt_residual_metrics = {}
         if "rollout_returns" in batch.batch:
@@ -553,6 +561,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
                 "critic/prompt_end_value/mean": prompt_end_value_mean,
                 # final response-aligned value available on the trajectory
                 "critic/trajectory_end_value/mean": trajectory_end_value_mean,
+                # mean absolute per-trajectory gap to accumulated sequence reward
+                "critic/prompt_end_vs_reward_gap": prompt_end_vs_reward_gap,
+                "critic/trajectory_end_vs_reward_gap": trajectory_end_vs_reward_gap,
                 # rho = Var(R - V_hat) / Var(R), using the same valid-token mask as vf_explained_var.
                 "critic/vf_rho": vf_rho,
                 # vf explained var
@@ -824,6 +835,8 @@ def compute_zero_critic_metrics() -> dict[str, float]:
         "critic/values/min": 0.0,
         "critic/prompt_end_value/mean": 0.0,
         "critic/trajectory_end_value/mean": 0.0,
+        "critic/prompt_end_vs_reward_gap": 0.0,
+        "critic/trajectory_end_vs_reward_gap": 0.0,
         "critic/grad_norm": 0.0,
     }
 
