@@ -636,6 +636,11 @@ class FSDPEngine(BaseEngine):
             if self.sparse_update_manager is not None:
                 self.sparse_update_manager.restore_frozen_params()
                 self.sparse_update_manager.mask_optimizer_state(self.optimizer)
+        if self.sparse_update_manager is not None:
+            sparse_update_metrics = self.sparse_update_manager.maybe_verify()
+            self._last_sparse_update_metrics = sparse_update_metrics
+        else:
+            self._last_sparse_update_metrics = {}
         return grad_norm.item()
 
     def lr_scheduler_step(self):

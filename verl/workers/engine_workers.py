@@ -349,6 +349,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
             output.pop("model_output")
             if lr is not None:
                 output["metrics"]["lr"] = lr
+            sparse_update_metrics = getattr(self.engine, "_last_sparse_update_metrics", {})
+            if sparse_update_metrics:
+                output["metrics"].update(sparse_update_metrics)
             final_output = self._postprocess_output(
                 output,
                 global_token_num=global_token_num,

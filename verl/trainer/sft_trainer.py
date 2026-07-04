@@ -114,6 +114,7 @@ class SFTTrainer:
         self.optimizer_config = omega_conf_to_dataclass(self.config.optim)
         self.checkpoint_config = omega_conf_to_dataclass(self.config.checkpoint)
         self.profiler_config = omega_conf_to_dataclass(self.config.profiler)
+        self.sparse_update_config = self.config.get("sparse_update", None)
 
         # check profile interval
         self.profiler_interval = self.config.trainer.profile_interval
@@ -140,6 +141,7 @@ class SFTTrainer:
             optimizer_config=self.optimizer_config,
             checkpoint_config=self.checkpoint_config,
             profiler_config=self.profiler_config,
+            sparse_update_config=self.sparse_update_config,
         )
 
         self.training_client = TrainingWorker(config=config)
