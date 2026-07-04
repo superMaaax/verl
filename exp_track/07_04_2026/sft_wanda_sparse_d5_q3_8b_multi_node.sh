@@ -151,7 +151,7 @@ generation_num_samples=${generation_num_samples:-1}
 generation_dtype=${generation_dtype:-null}
 
 generation_backend=${generation_backend:-vllm}
-generation_vllm_gpu_memory_utilization=${generation_vllm_gpu_memory_utilization:-0.8}
+generation_vllm_gpu_memory_utilization=${generation_vllm_gpu_memory_utilization:-0.6}
 generation_vllm_host_ip=${generation_vllm_host_ip:-127.0.0.1}
 generation_vllm_enforce_eager=${generation_vllm_enforce_eager:-True}
 generation_vllm_sync_weights=${generation_vllm_sync_weights:-True}
