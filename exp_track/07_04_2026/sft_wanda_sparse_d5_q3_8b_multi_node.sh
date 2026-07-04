@@ -79,9 +79,9 @@ mkdir -p "$LOG_DIR" "$TRAIN_LOG_DIR" "$ARCHIVE_ROOT"
 # -----------------------------
 # This is a small-data sparse fine-tune. Defaults are conservative for Qwen3-8B.
 train_batch_size=${train_batch_size:-8}
-micro_batch_size_per_gpu=${micro_batch_size_per_gpu:-1}
+micro_batch_size_per_gpu=${micro_batch_size_per_gpu:-16}
 max_length=${max_length:-18432}
-max_token_len_per_gpu=${max_token_len_per_gpu:-18432}
+max_token_len_per_gpu=${max_token_len_per_gpu:-294912}
 lr=${lr:-5e-6}
 total_epochs=${total_epochs:-5}
 save_freq=${save_freq:-50}
@@ -141,7 +141,7 @@ generation_eval_files=${generation_eval_files:-${VAL_FILE}}
 # Generation accuracy eval can be memory-heavy; start small unless you know memory is safe.
 # Qwen3 thinking mode for generation eval. Set generation_eval_enable_thinking=False to disable.
 generation_eval_enable_thinking=${generation_eval_enable_thinking:-True}
-generation_eval_batch_size=${generation_eval_batch_size:-32}
+generation_eval_batch_size=${generation_eval_batch_size:-64}
 generation_max_new_tokens=${generation_max_new_tokens:-18432}
 generation_do_sample=${generation_do_sample:-False}
 generation_temperature=${generation_temperature:-0.0}
