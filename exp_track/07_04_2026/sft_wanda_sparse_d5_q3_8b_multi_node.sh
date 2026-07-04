@@ -2,12 +2,12 @@
 #SBATCH --job-name=sft_qwen3_8b_wanda
 #SBATCH --account=ASC24079
 #SBATCH --partition=gh
-#SBATCH --nodes=4
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=72
-#SBATCH --time=04:00:00
-#SBATCH --output=sft_qwen3_8b_wanda-%j.out
-#SBATCH --error=sft_qwen3_8b_wanda-%j.err
+#SBATCH --time=00:20:00
+#SBATCH --output=sft_qwen3_8b_wanda-%j_d5.out
+#SBATCH --error=sft_qwen3_8b_wanda-%j_d5.err
 
 set -euo pipefail
 
@@ -77,10 +77,10 @@ mkdir -p "$LOG_DIR" "$TRAIN_LOG_DIR" "$ARCHIVE_ROOT"
 # SFT training defaults
 # -----------------------------
 # This is a small-data sparse fine-tune. Defaults are conservative for Qwen3-8B.
-train_batch_size=${train_batch_size:-128}
-micro_batch_size_per_gpu=${micro_batch_size_per_gpu:-16}
+train_batch_size=${train_batch_size:-1}
+micro_batch_size_per_gpu=${micro_batch_size_per_gpu:-1}
 max_length=${max_length:-18432}
-max_token_len_per_gpu=${max_token_len_per_gpu:-294912}
+max_token_len_per_gpu=${max_token_len_per_gpu:-18432}
 lr=${lr:-5e-6}
 total_epochs=${total_epochs:-5}
 save_freq=${save_freq:-50}
@@ -141,9 +141,9 @@ generation_eval_files=${generation_eval_files:-${VAL_FILE}}
 # Qwen3 thinking mode for generation eval. Set generation_eval_enable_thinking=False to disable.
 generation_eval_enable_thinking=${generation_eval_enable_thinking:-True}
 generation_eval_batch_size=${generation_eval_batch_size:-32}
-generation_max_new_tokens=${generation_max_new_tokens:-2048}
+generation_max_new_tokens=${generation_max_new_tokens:-18432}
 generation_do_sample=${generation_do_sample:-False}
-generation_temperature=${generation_temperature:-1.0}
+generation_temperature=${generation_temperature:-0.0}
 generation_top_p=${generation_top_p:-1.0}
 generation_top_k=${generation_top_k:-null}
 generation_num_samples=${generation_num_samples:-1}
