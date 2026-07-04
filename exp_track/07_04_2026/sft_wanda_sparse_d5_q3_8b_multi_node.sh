@@ -78,10 +78,10 @@ mkdir -p "$LOG_DIR" "$TRAIN_LOG_DIR" "$ARCHIVE_ROOT"
 # SFT training defaults
 # -----------------------------
 # This is a small-data sparse fine-tune. Defaults are conservative for Qwen3-8B.
-train_batch_size=${train_batch_size:-8}
-micro_batch_size_per_gpu=${micro_batch_size_per_gpu:-1}
+train_batch_size=${train_batch_size:-128}
+micro_batch_size_per_gpu=${micro_batch_size_per_gpu:-2}
 max_length=${max_length:-18432}
-max_token_len_per_gpu=${max_token_len_per_gpu:-18432}
+max_token_len_per_gpu=${max_token_len_per_gpu:-36864}
 lr=${lr:-5e-6}
 total_epochs=${total_epochs:-5}
 save_freq=${save_freq:-50}
@@ -129,7 +129,7 @@ SPARSE_UPDATE_MASK_OVERRIDES=(
 # -----------------------------
 # eval_method: loss, generation_reward, or both.
 eval_method=${eval_method:-generation_reward}
-eval_before_train=${eval_before_train:-True}
+eval_before_train=${eval_before_train:-False}
 eval_freq=${eval_freq:--1}
 loss_eval_freq=${loss_eval_freq:-50}
 generation_eval_freq=${generation_eval_freq:-50}
