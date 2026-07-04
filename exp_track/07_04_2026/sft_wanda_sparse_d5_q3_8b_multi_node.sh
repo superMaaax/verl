@@ -141,7 +141,7 @@ generation_eval_files=${generation_eval_files:-${VAL_FILE}}
 # Generation accuracy eval can be memory-heavy; start small unless you know memory is safe.
 # Qwen3 thinking mode for generation eval. Set generation_eval_enable_thinking=False to disable.
 generation_eval_enable_thinking=${generation_eval_enable_thinking:-True}
-generation_eval_batch_size=${generation_eval_batch_size:-64}
+generation_eval_batch_size=${generation_eval_batch_size:-32}
 generation_max_new_tokens=${generation_max_new_tokens:-18432}
 generation_do_sample=${generation_do_sample:-False}
 generation_temperature=${generation_temperature:-0.0}
@@ -151,7 +151,7 @@ generation_num_samples=${generation_num_samples:-1}
 generation_dtype=${generation_dtype:-null}
 
 generation_backend=${generation_backend:-vllm}
-generation_vllm_gpu_memory_utilization=${generation_vllm_gpu_memory_utilization:-0.6}
+generation_vllm_gpu_memory_utilization=${generation_vllm_gpu_memory_utilization:-0.8}
 generation_vllm_host_ip=${generation_vllm_host_ip:-127.0.0.1}
 generation_vllm_enforce_eager=${generation_vllm_enforce_eager:-True}
 generation_vllm_sync_weights=${generation_vllm_sync_weights:-True}
