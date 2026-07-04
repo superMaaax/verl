@@ -78,7 +78,7 @@ mkdir -p "$LOG_DIR" "$TRAIN_LOG_DIR" "$ARCHIVE_ROOT"
 # SFT training defaults
 # -----------------------------
 # This is a small-data sparse fine-tune. Defaults are conservative for Qwen3-8B.
-train_batch_size=${train_batch_size:-1}
+train_batch_size=${train_batch_size:-8}
 micro_batch_size_per_gpu=${micro_batch_size_per_gpu:-1}
 max_length=${max_length:-18432}
 max_token_len_per_gpu=${max_token_len_per_gpu:-18432}
