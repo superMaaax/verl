@@ -35,7 +35,6 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=true
 export HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR:-0}
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
-export WANDB_PROJECT=${WANDB_PROJECT:-prune_for_post_train}
 
 # Avoid inheriting incompatible local launch variables.
 unset MASTER_ADDR MASTER_PORT WORLD_SIZE RANK LOCAL_RANK GROUP_RANK ROLE_RANK ROLE_NAME TORCHELASTIC_RUN_ID || true
@@ -47,6 +46,8 @@ python3 -V
 # -----------------------------
 # Run identity and paths
 # -----------------------------
+export WANDB_PROJECT="prune_for_post_train"
+WANDB_PROJECT="prune_for_post_train"
 RUN_NAME="${RUN_NAME:-sft_qwen3_8b_wanda_sparse_kept_sparsity_d5}"
 REAL_SLURM_JOB_ID="${SLURM_JOB_ID:-manual}"
 RUN_ID="${RUN_NAME}_${REAL_SLURM_JOB_ID}"
@@ -140,7 +141,7 @@ generation_eval_files=${generation_eval_files:-${VAL_FILE}}
 # Generation accuracy eval can be memory-heavy; start small unless you know memory is safe.
 # Qwen3 thinking mode for generation eval. Set generation_eval_enable_thinking=False to disable.
 generation_eval_enable_thinking=${generation_eval_enable_thinking:-True}
-generation_eval_batch_size=${generation_eval_batch_size:-32}
+generation_eval_batch_size=${generation_eval_batch_size:-64}
 generation_max_new_tokens=${generation_max_new_tokens:-18432}
 generation_do_sample=${generation_do_sample:-False}
 generation_temperature=${generation_temperature:-0.0}
@@ -150,7 +151,7 @@ generation_num_samples=${generation_num_samples:-1}
 generation_dtype=${generation_dtype:-null}
 
 generation_backend=${generation_backend:-vllm}
-generation_vllm_gpu_memory_utilization=${generation_vllm_gpu_memory_utilization:-0.3}
+generation_vllm_gpu_memory_utilization=${generation_vllm_gpu_memory_utilization:-0.8}
 generation_vllm_host_ip=${generation_vllm_host_ip:-127.0.0.1}
 generation_vllm_enforce_eager=${generation_vllm_enforce_eager:-True}
 generation_vllm_sync_weights=${generation_vllm_sync_weights:-True}
@@ -419,7 +420,7 @@ srun --nodes="$NNODES" --ntasks="$NNODES" --ntasks-per-node=1 \
       engine=fsdp \
       model.path="'"${MODEL_PATH}"'" \
       trainer.default_local_dir="'"${TRAIN_LOG_DIR}"'" \
-      trainer.project_name=math_7500 \
+      trainer.project_name="${WANDB_PROJECT}" \
       trainer.experiment_name="'"${RUN_ID}"'" \
       trainer.total_epochs="'"${total_epochs}"'" \
       trainer.save_freq="'"${save_freq}"'" \
