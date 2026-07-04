@@ -31,6 +31,8 @@ data:
   generation_eval_max_prompt_length: 2048
   generation_eval_filter_overlong_prompts: False
   generation_eval_truncation: error
+  generation_eval_apply_chat_template_kwargs:
+    enable_thinking: null
   tools_key: tools  # Key for tools list in multi-turn mode
   enable_thinking_key: enable_thinking  # Whether to enable thinking in multi-turn mode
   enable_thinking_default: none         # The default value when enable_thinking_key is not present in the dataset

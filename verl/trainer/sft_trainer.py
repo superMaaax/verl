@@ -623,7 +623,9 @@ def create_generation_eval_dataset(data_paths, data_config, tokenizer, processor
 
 
 def extract_prompt_texts(raw_prompts, tokenizer, apply_chat_template_kwargs=None):
-    apply_chat_template_kwargs = apply_chat_template_kwargs or {}
+    apply_chat_template_kwargs = {
+        key: value for key, value in (apply_chat_template_kwargs or {}).items() if value is not None
+    }
     prompt_texts = []
     for raw_prompt in raw_prompts:
         messages = raw_prompt.tolist() if hasattr(raw_prompt, "tolist") else raw_prompt
@@ -983,7 +985,10 @@ def evaluate_generation_reward_batches(model, tokenizer, dataloader, device, con
             prompt_texts = extract_prompt_texts(
                 raw_prompts,
                 tokenizer,
-                apply_chat_template_kwargs=config.data.get("apply_chat_template_kwargs", {}),
+                apply_chat_template_kwargs=config.data.get(
+                    "generation_eval_apply_chat_template_kwargs",
+                    config.data.get("apply_chat_template_kwargs", {}),
+                ),
             )
             repeat_times = int(generation_config.get("n", 1))
             repeated_prompt_texts = [prompt for prompt in prompt_texts for _ in range(repeat_times)]

@@ -35,7 +35,7 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=true
 export HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR:-0}
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
-export WANDB_PROJECT=${WANDB_PROJECT:-SFT_midi}
+export WANDB_PROJECT=${WANDB_PROJECT:-prune_for_post_train}
 
 # Avoid inheriting incompatible local launch variables.
 unset MASTER_ADDR MASTER_PORT WORLD_SIZE RANK LOCAL_RANK GROUP_RANK ROLE_RANK ROLE_NAME TORCHELASTIC_RUN_ID || true
@@ -47,7 +47,7 @@ python3 -V
 # -----------------------------
 # Run identity and paths
 # -----------------------------
-RUN_NAME="${RUN_NAME:-Qwen3-8B-math7500-wanda-sparse-sft}"
+RUN_NAME="${RUN_NAME:-sft_qwen3_8b_wanda_sparse_kept_sparsity_d5}"
 REAL_SLURM_JOB_ID="${SLURM_JOB_ID:-manual}"
 RUN_ID="${RUN_NAME}_${REAL_SLURM_JOB_ID}"
 
@@ -156,6 +156,8 @@ loss_eval_files=${loss_eval_files:-${TRAIN_FILE}}
 generation_eval_files=${generation_eval_files:-${VAL_FILE}}
 
 # Generation accuracy eval can be memory-heavy; start small unless you know memory is safe.
+# Qwen3 thinking mode for generation eval. Set generation_eval_enable_thinking=False to disable.
+generation_eval_enable_thinking=${generation_eval_enable_thinking:-True}
 generation_eval_batch_size=${generation_eval_batch_size:-32}
 generation_max_new_tokens=${generation_max_new_tokens:-2048}
 generation_do_sample=${generation_do_sample:-False}
@@ -242,10 +244,21 @@ describe_path() {
 }
 
 sync_to_work() {
-  echo "Syncing run directory back to WORK..."
+  echo "Syncing lightweight logs/metadata back to WORK; checkpoints stay on SCRATCH."
   mkdir -p "$ARCHIVE_DIR"
-  rsync -a "$RUN_DIR"/ "$ARCHIVE_DIR"/ || true
-  echo "Archived run to: $ARCHIVE_DIR"
+  rsync -a \
+    --exclude='**/global_step_*' \
+    --exclude='**/checkpoints/**' \
+    --exclude='**/model_world_size_*_rank_*.pt' \
+    --exclude='**/optim_world_size_*_rank_*.pt' \
+    --exclude='**/extra_state_world_size_*_rank_*.pt' \
+    --exclude='**/sparse_update_state_rank_*.pt' \
+    --exclude='**/huggingface/**' \
+    --exclude='**/*.safetensors' \
+    --exclude='**/pytorch_model*.bin' \
+    "$RUN_DIR"/ "$ARCHIVE_DIR"/ || true
+  echo "Archived lightweight run files to: $ARCHIVE_DIR"
+  echo "Checkpoint/model artifacts remain on SCRATCH at: $TRAIN_LOG_DIR"
 }
 
 cleanup() {
@@ -300,6 +313,7 @@ describe_path "TRAIN_FILE" "$TRAIN_FILE"
 describe_path "VAL_FILE" "$VAL_FILE"
 describe_path "loss_eval_files" "$loss_eval_files"
 describe_path "generation_eval_files" "$generation_eval_files"
+echo "generation_eval_enable_thinking: $generation_eval_enable_thinking"
 echo "SPARSE_UPDATE_MODE: $SPARSE_UPDATE_MODE"
 echo "SPARSE_UPDATE_SPARSITY: $SPARSE_UPDATE_SPARSITY"
 echo "SPARSE_UPDATE_KEEP_FRACTION: ${SPARSE_UPDATE_KEEP_FRACTION:-1 - sparsity}"
@@ -356,6 +370,7 @@ srun --nodes="$NNODES" --ntasks="$NNODES" --ntasks-per-node=1 \
       data.loss_val_files="'"${loss_eval_files}"'" \
       data.generation_eval_files="'"${generation_eval_files}"'" \
       data.generation_eval_batch_size="'"${generation_eval_batch_size}"'" \
+      data.generation_eval_apply_chat_template_kwargs.enable_thinking="'"${generation_eval_enable_thinking}"'" \
       data.messages_key=messages \
       data.train_batch_size="'"${train_batch_size}"'" \
       data.micro_batch_size_per_gpu="'"${micro_batch_size_per_gpu}"'" \
