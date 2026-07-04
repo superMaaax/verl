@@ -58,22 +58,9 @@ export HF_MODULES_CACHE_ROOT
 
 WORK_DIR="${WORK_DIR:-/work2/09576/shuozhe/verl}"
 MODEL_INIT_CKPT="${MODEL_INIT_CKPT:-/work2/09576/shuozhe/saved_model/Qwen3-8B}"
-TRAIN_FILE="${TRAIN_FILE:-/work2/09576/shuozhe/saved_dataset/MetaMathQA-math-500/math7500_sft.parquet}"
+TRAIN_FILE="${TRAIN_FILE:-/work2/09576/shuozhe/gradient_prune/saved_calibration_dataset/qwen3-8b-instruct_math7500_correct_5_response/qwen3-8b-instruct_math7500_correct_5_response.parquet}"
 VAL_FILE="${VAL_FILE:-/work2/09576/shuozhe/saved_dataset/MetaMathQA-math-500/test.parquet}"
 
-# Allow syntax tests and local runs under /data/shuozhe while preserving TACC defaults.
-if [[ ! -d "$WORK_DIR" && -d "/data/shuozhe/verl" ]]; then
-  WORK_DIR="/data/shuozhe/verl"
-fi
-if [[ ! -d "$MODEL_INIT_CKPT" && -d "/data/shuozhe/saved_model/Qwen3-8B" ]]; then
-  MODEL_INIT_CKPT="/data/shuozhe/saved_model/Qwen3-8B"
-fi
-if [[ ! -f "$TRAIN_FILE" && -f "/data/shuozhe/saved_dataset/MetaMathQA-math-500/math7500_sft.parquet" ]]; then
-  TRAIN_FILE="/data/shuozhe/saved_dataset/MetaMathQA-math-500/math7500_sft.parquet"
-fi
-if [[ ! -f "$VAL_FILE" && -f "/data/shuozhe/saved_dataset/MetaMathQA-math-500/test.parquet" ]]; then
-  VAL_FILE="/data/shuozhe/saved_dataset/MetaMathQA-math-500/test.parquet"
-fi
 export PYTHONPATH="${WORK_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
 SCRATCH_ROOT="${SCRATCH_ROOT:-${SCRATCH}/verl_runs}"
@@ -90,10 +77,10 @@ mkdir -p "$LOG_DIR" "$TRAIN_LOG_DIR" "$ARCHIVE_ROOT"
 # SFT training defaults
 # -----------------------------
 # This is a small-data sparse fine-tune. Defaults are conservative for Qwen3-8B.
-train_batch_size=${train_batch_size:-32}
-micro_batch_size_per_gpu=${micro_batch_size_per_gpu:-1}
-max_length=${max_length:-4096}
-max_token_len_per_gpu=${max_token_len_per_gpu:-4096}
+train_batch_size=${train_batch_size:-128}
+micro_batch_size_per_gpu=${micro_batch_size_per_gpu:-16}
+max_length=${max_length:-18432}
+max_token_len_per_gpu=${max_token_len_per_gpu:-294912}
 lr=${lr:-5e-6}
 total_epochs=${total_epochs:-5}
 save_freq=${save_freq:-50}
@@ -107,13 +94,8 @@ save_freq=${save_freq:-50}
 SPARSE_UPDATE_MODE="wanda_top"
 SPARSE_UPDATE_SPARSITY="${SPARSE_UPDATE_SPARSITY:-0.5}"
 SPARSE_UPDATE_KEEP_FRACTION="${SPARSE_UPDATE_KEEP_FRACTION:-}"
-WANDA_SCORE_DIR="${WANDA_SCORE_DIR:-/work2/09576/shuozhe/saved_score/scratch/09576/shuozhe/gradient_prune/results/qwen3_8b_wanda_math7500/scores}"
-if [[ ! -d "$WANDA_SCORE_DIR" && -d "/data/shuozhe/saved_score/scratch/09576/shuozhe/gradient_prune/results/qwen3_8b_wanda_math7500/scores" ]]; then
-  WANDA_SCORE_DIR="/data/shuozhe/saved_score/scratch/09576/shuozhe/gradient_prune/results/qwen3_8b_wanda_math7500/scores"
-fi
-if [[ ! -d "$MODEL_INIT_CKPT" && -d "/data/shuozhe/saved_model/Qwen3-8B" ]]; then
-  MODEL_INIT_CKPT="/data/shuozhe/saved_model/Qwen3-8B"
-fi
+WANDA_SCORE_DIR="${WANDA_SCORE_DIR:-/scratch/09576/shuozhe/gradient_prune/results/qwen3_8b_wanda_math7500/scores}"
+
 if [[ -n "$SPARSE_UPDATE_KEEP_FRACTION" ]]; then
   SPARSE_UPDATE_MASK_TAG="keep_fraction_${SPARSE_UPDATE_KEEP_FRACTION}"
 else
@@ -152,7 +134,7 @@ loss_eval_freq=${loss_eval_freq:-50}
 generation_eval_freq=${generation_eval_freq:-50}
 
 # loss_eval_files must be SFT messages format; generation_eval_files must be PPO prompt+reward_model format.
-loss_eval_files=${loss_eval_files:-${TRAIN_FILE}}
+loss_eval_files=${loss_eval_files:-__TRAIN_FILE__}
 generation_eval_files=${generation_eval_files:-${VAL_FILE}}
 
 # Generation accuracy eval can be memory-heavy; start small unless you know memory is safe.
@@ -269,6 +251,61 @@ trap cleanup EXIT
 MODEL_PATH="$(resolve_model_init_path "$MODEL_INIT_CKPT" actor)"
 
 # -----------------------------
+# Prepare SFT training data
+# -----------------------------
+RAW_TRAIN_FILE="$TRAIN_FILE"
+SFT_PREPARED_DATA_DIR="${SFT_PREPARED_DATA_DIR:-${RUN_DIR}/prepared_data}"
+SFT_TRAIN_FILE="${SFT_TRAIN_FILE:-${SFT_PREPARED_DATA_DIR}/train_sft_messages.parquet}"
+SFT_MAX_SAMPLES="${SFT_MAX_SAMPLES:--1}"
+SFT_DEDUP_BY_PROMPT="${SFT_DEDUP_BY_PROMPT:-false}"
+SFT_RESPONSE_FILTER_CORRECT="${SFT_RESPONSE_FILTER_CORRECT:-true}"
+SFT_ENABLE_THINKING_COLUMN="${SFT_ENABLE_THINKING_COLUMN:-}"
+SFT_REUSE_PREPARED_DATA="${SFT_REUSE_PREPARED_DATA:-false}"
+
+prepare_sft_data() {
+  local input_path="$1"
+  local output_path="$2"
+  local converter="$WORK_DIR/tools/prepare_sft_messages_data.py"
+  local converter_args=(
+    --input "$input_path"
+    --output "$output_path"
+    --max-samples "$SFT_MAX_SAMPLES"
+  )
+
+  if [[ "$SFT_DEDUP_BY_PROMPT" == "true" ]]; then
+    converter_args+=(--dedup-by-prompt)
+  fi
+  if [[ "$SFT_RESPONSE_FILTER_CORRECT" != "true" ]]; then
+    converter_args+=(--no-filter-correct)
+  fi
+  if [[ -n "$SFT_ENABLE_THINKING_COLUMN" ]]; then
+    converter_args+=(--enable-thinking "$SFT_ENABLE_THINKING_COLUMN")
+  fi
+
+  python3 "$converter" "${converter_args[@]}"
+}
+
+mkdir -p "$SFT_PREPARED_DATA_DIR"
+case "${TRAIN_FILE##*.}" in
+  jsonl|parquet|pq)
+    if [[ "$SFT_REUSE_PREPARED_DATA" == "true" && -f "$SFT_TRAIN_FILE" ]]; then
+      echo "Reusing prepared SFT messages dataset: $SFT_TRAIN_FILE" | tee "$LOG_DIR/prepare_sft_data.log"
+    else
+      echo "Preparing SFT messages dataset from: $TRAIN_FILE"
+      prepare_sft_data "$TRAIN_FILE" "$SFT_TRAIN_FILE" | tee "$LOG_DIR/prepare_sft_data.log"
+    fi
+    TRAIN_FILE="$SFT_TRAIN_FILE"
+    ;;
+  *)
+    echo "Unsupported TRAIN_FILE extension: $TRAIN_FILE" >&2
+    exit 1
+    ;;
+esac
+if [[ "$loss_eval_files" == "__TRAIN_FILE__" || "$loss_eval_files" == "$RAW_TRAIN_FILE" ]]; then
+  loss_eval_files="$TRAIN_FILE"
+fi
+
+# -----------------------------
 # Build WANDA kept-parameter mask
 # -----------------------------
 # Build the mask before torchrun so failures happen early and all ranks load one identical mask.
@@ -376,6 +413,7 @@ srun --nodes="$NNODES" --ntasks="$NNODES" --ntasks-per-node=1 \
       data.micro_batch_size_per_gpu="'"${micro_batch_size_per_gpu}"'" \
       data.max_length="'"${max_length}"'" \
       data.max_token_len_per_gpu="'"${max_token_len_per_gpu}"'" \
+      data.ignore_input_ids_mismatch=True \
       data.num_workers=8 \
       optim.lr="'"${lr}"'" \
       engine=fsdp \
